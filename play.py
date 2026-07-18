@@ -637,17 +637,17 @@ def main():
     print(f"Screen resolution: {screen_w}x{screen_h}")
 
     print("Loading YOLOv8n model...")
-    model = YOLO("yolov8n.pt")
+    model = YOLO("models/yolov8n.pt")
     print("Model ready.")
 
     sahi_model = None
     if MERGE_MODE == "SAHI":
         print("Loading SAHI detection model...")
-        sahi_model = init_sahi_model("yolov8n.pt")
+        sahi_model = init_sahi_model("models/yolov8n.pt")
         print("SAHI model ready.")
     print()
 
-    lane_model_path = os.path.join(os.getcwd(), "EgoLanes_Lite_FP32.onnx")
+    lane_model_path = os.path.join(os.getcwd(), "models/EgoLanes_Lite_FP32.onnx")
     if os.path.exists(lane_model_path):
         print("Loading lane detection model...")
         lane_sess = init_lane_model(lane_model_path)
