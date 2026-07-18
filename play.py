@@ -1,8 +1,5 @@
 import cv2
-import pandas as pd
-import subprocess
 import os
-import glob
 import tempfile
 import argparse
 import numpy as np
@@ -14,6 +11,15 @@ import onnxruntime as ort
 from ultralytics import YOLO
 from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
+from common import (
+    discover_input_videos,
+    draw_crop_box,
+    extract_gps,
+    fit_frame,
+    get_lower_2to1_crop,
+    get_screen_resolution,
+    load_gps,
+)
 
 # COCO class IDs for vehicles
 VEHICLE_CLASSES = {2: "CAR", 3: "MOTO", 5: "BUS", 7: "TRUCK"}
@@ -34,21 +40,6 @@ TOPDOWN_HORIZON_FRAC = 0.42
 TOPDOWN_MAX_DEPTH_M = 80.0
 TOPDOWN_WIDTH_M = 24.0
 TOPDOWN_EGO_LANE_WIDTH_M = 3.7
-
-def get_screen_resolution():
-    """Get screen resolution using xrandr or fallback."""
-    try:
-        result = subprocess.run(["xrandr"], capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if " connected primary" in line or (" connected" in line and "*" in result.stdout):
-                parts = line.split()
-                for part in parts:
-                    if "x" in part and part[0].isdigit():
-                        w, h = part.split("x")
-                        return int(w), int(h)
-    except Exception:
-        pass
-    return 1920, 1080  # fallback
 
 class VehicleTracker:
     """IoU-based centroid tracker that maintains persistent vehicle IDs."""
@@ -191,7 +182,7 @@ def init_sahi_model(model_path, conf_thresh=0.4):
     )
 
 
-def _detect_sahi(frame, sahi_model):
+def _detect_sahi(frame, sahi_model, x_offset=0, y_offset=0):
     """SAHI sliced inference — best for small/distant objects."""
     # SAHI expects RGB
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -211,7 +202,8 @@ def _detect_sahi(frame, sahi_model):
         if cls_id not in VEHICLE_CLASSES:
             continue
         x1, y1, x2, y2 = (int(v) for v in pred.bbox.to_xyxy())
-        dets.append((x1, y1, x2, y2, cls_id))
+        dets.append((x1 + x_offset, y1 + y_offset,
+                     x2 + x_offset, y2 + y_offset, cls_id))
     return dets
 
 
@@ -219,7 +211,7 @@ def _detect_sahi(frame, sahi_model):
 MERGE_MODE = "SAHI"
 
 
-def detect_vehicles(frame, model, sahi_model=None):
+def detect_vehicles(frame, model, sahi_model=None, crop_rect=None):
     """
     Detect vehicles using the active MERGE_MODE:
       SAHI — sliced inference (best recall for small/distant objects, default)
@@ -227,14 +219,22 @@ def detect_vehicles(frame, model, sahi_model=None):
       NMS  — dual-pass (full + center crop) merged with standard NMS
     Returns list of (x1, y1, x2, y2, class_id).
     """
-    if MERGE_MODE == "SAHI" and sahi_model is not None:
-        return _detect_sahi(frame, sahi_model)
+    x0, y0 = 0, 0
+    proc_frame = frame
+    if crop_rect is not None:
+        x0, y0, cw, ch = crop_rect
+        proc_frame = frame[y0:y0 + ch, x0:x0 + cw]
 
-    all_dets, fw, fh = _dual_pass_raw(frame, model)
+    if MERGE_MODE == "SAHI" and sahi_model is not None:
+        return _detect_sahi(proc_frame, sahi_model, x_offset=x0, y_offset=y0)
+
+    all_dets, fw, fh = _dual_pass_raw(proc_frame, model)
 
     if MERGE_MODE == "NMW":
-        return _apply_nmw(all_dets, fw, fh)
-    return _apply_nms(all_dets, fw, fh)  # NMS (default fallback)
+        local = _apply_nmw(all_dets, fw, fh)
+    else:
+        local = _apply_nms(all_dets, fw, fh)  # NMS (default fallback)
+    return [(x1 + x0, y1 + y0, x2 + x0, y2 + y0, cls_id) for x1, y1, x2, y2, cls_id in local]
 
 
 def estimate_speed(track_history, frame_w, ego_kmh):
@@ -394,10 +394,11 @@ def _fit_lane_poly(mask, min_y_frac=LANE_START_Y):
     return np.polyfit(ys, xs, 2)
 
 
-def detect_and_draw_lanes(frame, lane_sess):
+def detect_and_draw_lanes(frame, lane_sess, draw_overlay=True, x_offset=0, y_offset=0):
     """
     Run lane detection and draw left/right ego lane lines + fill onto frame in-place.
-    Returns dict with frame-space lane points: {"left": pts or None, "right": pts or None}
+    Returns dict with frame-space lane points and raw points:
+    {"left": pts or None, "right": pts or None, "left_raw": Nx2, "right_raw": Nx2}
     """
     fh, fw = frame.shape[:2]
 
@@ -439,11 +440,28 @@ def detect_and_draw_lanes(frame, lane_sess):
         pts_y = (ys  * scale_y).astype(int)
         return np.stack([pts_x, pts_y], axis=1)
 
+    def mask_to_frame_raw(mask, step=8):
+        y_start = int(LANE_H * LANE_START_Y)
+        ys, xs = np.where(mask[y_start:] > 0)
+        if len(xs) == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        ys = ys + y_start
+        # Downsample points to keep debug overlay lightweight.
+        if len(xs) > step:
+            xs = xs[::step]
+            ys = ys[::step]
+        pts_x = (xs * scale_x).astype(np.int32)
+        pts_y = (ys * scale_y).astype(np.int32)
+        return np.stack([pts_x, pts_y], axis=1)
+
     pts_l = None
     pts_r = None
 
+    left_raw = mask_to_frame_raw(left_mask)
+    right_raw = mask_to_frame_raw(right_mask)
+
     # ── draw fill between lanes ─────────────────────────────────────────────
-    if poly_l is not None and poly_r is not None:
+    if draw_overlay and poly_l is not None and poly_r is not None:
         pts_l = model_to_frame_pts(poly_l, ys_model)
         pts_r = model_to_frame_pts(poly_r, ys_model)
         # Only fill if left stays left of right (sanity check)
@@ -453,15 +471,51 @@ def detect_and_draw_lanes(frame, lane_sess):
             cv2.fillPoly(overlay, [fill_pts], LANE_FILL_COLOR)
             cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
 
-    # ── draw lane lines ──────────────────────────────────────────────────────
-    for poly, color in [(poly_l, LANE_LEFT_COLOR), (poly_r, LANE_RIGHT_COLOR)]:
-        if poly is None:
-            continue
-        pts = model_to_frame_pts(poly, ys_model).reshape(-1, 1, 2)
-        cv2.polylines(frame, [pts], isClosed=False, color=color,
-                      thickness=4, lineType=cv2.LINE_AA)
+    if not draw_overlay:
+        if poly_l is not None:
+            pts_l = model_to_frame_pts(poly_l, ys_model)
+        if poly_r is not None:
+            pts_r = model_to_frame_pts(poly_r, ys_model)
 
-    return {"left": pts_l, "right": pts_r}
+    # ── draw lane lines ──────────────────────────────────────────────────────
+    if draw_overlay:
+        for poly, color in [(poly_l, LANE_LEFT_COLOR), (poly_r, LANE_RIGHT_COLOR)]:
+            if poly is None:
+                continue
+            pts = model_to_frame_pts(poly, ys_model).reshape(-1, 1, 2)
+            cv2.polylines(frame, [pts], isClosed=False, color=color,
+                          thickness=4, lineType=cv2.LINE_AA)
+
+    if pts_l is not None:
+        pts_l = pts_l.copy()
+        pts_l[:, 0] += x_offset
+        pts_l[:, 1] += y_offset
+    if pts_r is not None:
+        pts_r = pts_r.copy()
+        pts_r[:, 0] += x_offset
+        pts_r[:, 1] += y_offset
+    if left_raw is not None and len(left_raw) > 0:
+        left_raw = left_raw.copy()
+        left_raw[:, 0] += x_offset
+        left_raw[:, 1] += y_offset
+    if right_raw is not None and len(right_raw) > 0:
+        right_raw = right_raw.copy()
+        right_raw[:, 0] += x_offset
+        right_raw[:, 1] += y_offset
+
+    return {"left": pts_l, "right": pts_r, "left_raw": left_raw, "right_raw": right_raw}
+
+
+def draw_raw_lane_debug(frame, lane_result):
+    """Plot raw EgoLanes pixel hits to help alignment debugging."""
+    if lane_result is None:
+        return
+    for key, color in (("left_raw", (0, 255, 255)), ("right_raw", (0, 128, 255))):
+        pts = lane_result.get(key)
+        if pts is None or len(pts) == 0:
+            continue
+        for x, y in pts:
+            cv2.circle(frame, (int(x), int(y)), 1, color, -1, lineType=cv2.LINE_AA)
 
 
 def _pixel_to_ground(u, v, frame_w, frame_h):
@@ -527,6 +581,29 @@ def _shift_lane_x(points_xz, shift_m):
     return shifted
 
 
+def _draw_topdown_fov_funnel(bev, frame_w, frame_h):
+    """Draw a 140-degree field-of-view funnel in BEV space."""
+    half_fov = np.deg2rad(CAMERA_FOV_DEG * 0.5)
+    max_z = TOPDOWN_MAX_DEPTH_M
+    edge_x = np.tan(half_fov) * max_z
+
+    apex = _world_to_canvas(np.array([[0.0, 0.0]], dtype=np.float32), frame_w, frame_h)
+    left = _world_to_canvas(np.array([[-edge_x, max_z]], dtype=np.float32), frame_w, frame_h)
+    right = _world_to_canvas(np.array([[edge_x, max_z]], dtype=np.float32), frame_w, frame_h)
+    if apex is None or left is None or right is None:
+        return
+
+    a = tuple(apex[0, 0])
+    l = tuple(left[0, 0])
+    r = tuple(right[0, 0])
+    overlay = bev.copy()
+    poly = np.array([a, l, r], dtype=np.int32).reshape(-1, 1, 2)
+    cv2.fillPoly(overlay, [poly], (45, 35, 18))
+    cv2.addWeighted(overlay, 0.22, bev, 0.78, 0, bev)
+    cv2.line(bev, a, l, (180, 150, 70), 2, cv2.LINE_AA)
+    cv2.line(bev, a, r, (180, 150, 70), 2, cv2.LINE_AA)
+
+
 def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
     """Build a top-down assumed-position view using FOV-based geometry."""
     bev = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
@@ -536,6 +613,8 @@ def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
         t = y / max(frame_h - 1, 1)
         shade = int(18 + 28 * (1.0 - t))
         bev[y, :] = (shade, shade, shade)
+
+    _draw_topdown_fov_funnel(bev, frame_w, frame_h)
 
     # Depth ticks
     for d in range(10, int(TOPDOWN_MAX_DEPTH_M) + 1, 10):
@@ -606,7 +685,10 @@ def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
                 sign = "+" if diff_mph >= 0 else ""
                 txt = f"{label_name} {spd_mph:.0f} ({sign}{diff_mph:.0f})"
 
-        cv2.rectangle(bev, (vx - 8, vy - 12), (vx + 8, vy + 12), color, -1)
+        # Use oriented-ish box dimensions by distance assumption (closer appears larger).
+        box_w = max(8, int(18 - 0.12 * p[1]))
+        box_h = max(12, int(26 - 0.18 * p[1]))
+        cv2.rectangle(bev, (vx - box_w, vy - box_h), (vx + box_w, vy + box_h), color, 2)
         cv2.putText(bev, txt, (vx + 10, vy - 4), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (235, 235, 235), 1, cv2.LINE_AA)
 
@@ -614,43 +696,6 @@ def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
                 (12, 24), cv2.FONT_HERSHEY_DUPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
     return bev
 
-
-def extract_gps(video_path, csv_path):
-    """Extract GPS data from video using exiftool."""
-    cmd = [
-        "exiftool", "-ee3",
-        "-p", "$QuickTime:GPSDateTime,$QuickTime:GPSLatitude,$QuickTime:GPSLongitude,$QuickTime:GPSSpeed,$QuickTime:GPSTrack",
-        video_path
-    ]
-    with open(csv_path, "w") as f:
-        subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
-
-def load_gps(csv_path):
-    """Load GPS CSV and parse start datetime. Returns (df, start_dt) or (None, None)."""
-    try:
-        df = pd.read_csv(csv_path, names=['Time', 'Lat', 'Lon', 'Speed', 'Track'])
-        if df.empty or df['Time'].isna().all():
-            return None, None
-        raw_time = df['Time'].iloc[0]
-        clean_time = str(raw_time).replace('Z', '').replace(':', '-', 2)
-        start_dt = pd.to_datetime(clean_time, utc=True)
-        return df, start_dt
-    except Exception:
-        return None, None
-
-def fit_frame(frame, screen_w, screen_h):
-    """Resize frame to fill screen while maintaining aspect ratio (letterbox/pillarbox)."""
-    fh, fw = frame.shape[:2]
-    scale = min(screen_w / fw, screen_h / fh)
-    new_w = int(fw * scale)
-    new_h = int(fh * scale)
-    resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-    # Pad to fill screen
-    canvas = __import__('numpy').zeros((screen_h, screen_w, 3), dtype=resized.dtype)
-    x_off = (screen_w - new_w) // 2
-    y_off = (screen_h - new_h) // 2
-    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
-    return canvas
 
 def overlay_info(frame, gps_time_display, time_display, lat, lon, speed_kmh):
     """Draw a single info bar across the top of the frame."""
@@ -705,6 +750,9 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     show_topdown = False
+    yolo_enabled = True
+    ego_enabled = True
+    raw_lane_debug = False
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -744,16 +792,25 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
 
         # Lane detection (drawn first so vehicle boxes appear on top)
         fh, fw = frame.shape[:2]
-        lane_result = {"left": None, "right": None}
-        if lane_sess is not None:
-            lane_result = detect_and_draw_lanes(frame, lane_sess)
+        crop_rect = get_lower_2to1_crop(fw, fh)
+        draw_crop_box(frame, crop_rect)
+
+        lane_result = {"left": None, "right": None, "left_raw": np.empty((0, 2), dtype=np.int32), "right_raw": np.empty((0, 2), dtype=np.int32)}
+        if ego_enabled and lane_sess is not None:
+            cx, cy, cw, ch = crop_rect
+            lane_roi = frame[cy:cy + ch, cx:cx + cw]
+            lane_result = detect_and_draw_lanes(lane_roi, lane_sess, draw_overlay=True, x_offset=cx, y_offset=cy)
+            if raw_lane_debug:
+                draw_raw_lane_debug(frame, lane_result)
 
         # Vehicle detection + tracking + speed overlay
         timestamp_s = frame_idx / fps
-        detections = detect_vehicles(frame, model, sahi_model)
-        tracked = tracker.update(detections, timestamp_s)
-        draw_vehicles(frame, tracked, fw, interp_speed)
-        draw_bottom_banner(frame, tracked, fw, interp_speed)
+        tracked = []
+        if yolo_enabled:
+            detections = detect_vehicles(frame, model, sahi_model, crop_rect=crop_rect)
+            tracked = tracker.update(detections, timestamp_s)
+            draw_vehicles(frame, tracked, fw, interp_speed)
+            draw_bottom_banner(frame, tracked, fw, interp_speed)
 
         topdown = draw_top_down_view(fw, fh, tracked, lane_result, interp_speed)
 
@@ -761,6 +818,9 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
         fname = f"{file_idx}/{total_files}: {os.path.basename(video_path)}"
         cv2.putText(frame, fname, (fw - 700, 50), cv2.FONT_HERSHEY_SIMPLEX,
                     0.8, (200, 200, 0), 2, cv2.LINE_AA)
+        status = f"D:Topdown {'ON' if show_topdown else 'OFF'}  Y:YOLO {'ON' if yolo_enabled else 'OFF'}  E:EgoLanes {'ON' if ego_enabled else 'OFF'}  R:RawLane {'ON' if raw_lane_debug else 'OFF'}"
+        cv2.putText(frame, status, (16, fh - 16), cv2.FONT_HERSHEY_SIMPLEX,
+                0.62, (240, 240, 240), 2, cv2.LINE_AA)
 
         display_frame = topdown if show_topdown else frame
         display = fit_frame(display_frame, screen_w, screen_h)
@@ -777,6 +837,12 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
             break          # skip to next video
         if key == ord('d'):
             show_topdown = not show_topdown
+        if key == ord('y'):
+            yolo_enabled = not yolo_enabled
+        if key == ord('e'):
+            ego_enabled = not ego_enabled
+        if key == ord('r'):
+            raw_lane_debug = not raw_lane_debug
 
     cap.release()
     return True  # continue to next
@@ -796,15 +862,14 @@ def main():
     print(f"Merge mode: {MERGE_MODE}")
 
     cwd = os.getcwd()
-    mp4_files = sorted(glob.glob(os.path.join(cwd, "*.MP4")) +
-                       glob.glob(os.path.join(cwd, "*.mp4")))
+    mp4_files = discover_input_videos(cwd)
 
     if not mp4_files:
-        print("No MP4 files found in current directory.")
+        print("No source MP4 files found. Place videos in current directory or camera/.")
         return
 
     print(f"Found {len(mp4_files)} MP4 file(s).")
-    print("Controls: [Q] Quit  [N] Next video  [D] Toggle camera/top-down display\n")
+    print("Controls: [Q] Quit  [N] Next video  [D] Toggle camera/top-down display  [Y] Toggle YOLO  [E] Toggle EgoLanes  [R] Toggle raw-lane debug\n")
 
     screen_w, screen_h = get_screen_resolution()
     print(f"Screen resolution: {screen_w}x{screen_h}")
