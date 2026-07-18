@@ -28,6 +28,13 @@ SPEED_HISTORY = 10
 
 KMH_TO_MPH = 0.621371
 
+# Camera / bird's-eye assumptions (until a monocular depth model is provided)
+CAMERA_FOV_DEG = 140.0
+TOPDOWN_HORIZON_FRAC = 0.42
+TOPDOWN_MAX_DEPTH_M = 80.0
+TOPDOWN_WIDTH_M = 24.0
+TOPDOWN_EGO_LANE_WIDTH_M = 3.7
+
 def get_screen_resolution():
     """Get screen resolution using xrandr or fallback."""
     try:
@@ -390,6 +397,7 @@ def _fit_lane_poly(mask, min_y_frac=LANE_START_Y):
 def detect_and_draw_lanes(frame, lane_sess):
     """
     Run lane detection and draw left/right ego lane lines + fill onto frame in-place.
+    Returns dict with frame-space lane points: {"left": pts or None, "right": pts or None}
     """
     fh, fw = frame.shape[:2]
 
@@ -431,6 +439,9 @@ def detect_and_draw_lanes(frame, lane_sess):
         pts_y = (ys  * scale_y).astype(int)
         return np.stack([pts_x, pts_y], axis=1)
 
+    pts_l = None
+    pts_r = None
+
     # ── draw fill between lanes ─────────────────────────────────────────────
     if poly_l is not None and poly_r is not None:
         pts_l = model_to_frame_pts(poly_l, ys_model)
@@ -449,6 +460,159 @@ def detect_and_draw_lanes(frame, lane_sess):
         pts = model_to_frame_pts(poly, ys_model).reshape(-1, 1, 2)
         cv2.polylines(frame, [pts], isClosed=False, color=color,
                       thickness=4, lineType=cv2.LINE_AA)
+
+    return {"left": pts_l, "right": pts_r}
+
+
+def _pixel_to_ground(u, v, frame_w, frame_h):
+    """Project an image pixel to assumed ground-plane coordinates (x_m, z_m)."""
+    cx = frame_w / 2.0
+    focal_px = (frame_w / 2.0) / np.tan(np.deg2rad(CAMERA_FOV_DEG / 2.0))
+    horizon_y = frame_h * TOPDOWN_HORIZON_FRAC
+    dv = v - horizon_y
+    if dv <= 1.0:
+        return None
+
+    k = (frame_h - horizon_y) * 5.0
+    z_m = k / dv
+    if z_m <= 0 or z_m > TOPDOWN_MAX_DEPTH_M:
+        return None
+
+    x_m = ((u - cx) / focal_px) * z_m
+    return x_m, z_m
+
+
+def _lane_pts_to_ground(lane_pts, frame_w, frame_h):
+    """Convert frame-space lane points to ground-plane coordinates."""
+    if lane_pts is None:
+        return None
+    world_pts = []
+    for u, v in lane_pts:
+        p = _pixel_to_ground(float(u), float(v), frame_w, frame_h)
+        if p is not None:
+            world_pts.append(p)
+    if len(world_pts) < 2:
+        return None
+    world_pts = np.array(world_pts, dtype=np.float32)
+    order = np.argsort(world_pts[:, 1])
+    return world_pts[order]
+
+
+def _world_to_canvas(points_xz, out_w, out_h):
+    """Map ground-plane coordinates (x,z) in metres into top-down canvas pixels."""
+    if points_xz is None or len(points_xz) == 0:
+        return None
+
+    m_per_px_x = TOPDOWN_WIDTH_M / max(out_w, 1)
+    m_per_px_z = TOPDOWN_MAX_DEPTH_M / max(out_h - 20, 1)
+    px = (out_w * 0.5 + points_xz[:, 0] / m_per_px_x).astype(np.int32)
+    py = (out_h - 10 - points_xz[:, 1] / m_per_px_z).astype(np.int32)
+    pts = np.stack([px, py], axis=1)
+    in_bounds = (
+        (pts[:, 0] >= 0) & (pts[:, 0] < out_w) &
+        (pts[:, 1] >= 0) & (pts[:, 1] < out_h)
+    )
+    pts = pts[in_bounds]
+    if len(pts) < 2:
+        return None
+    return pts.reshape(-1, 1, 2)
+
+
+def _shift_lane_x(points_xz, shift_m):
+    """Shift lane polyline laterally in world coordinates."""
+    if points_xz is None:
+        return None
+    shifted = points_xz.copy()
+    shifted[:, 0] += shift_m
+    return shifted
+
+
+def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
+    """Build a top-down assumed-position view using FOV-based geometry."""
+    bev = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+
+    # Road background gradient
+    for y in range(frame_h):
+        t = y / max(frame_h - 1, 1)
+        shade = int(18 + 28 * (1.0 - t))
+        bev[y, :] = (shade, shade, shade)
+
+    # Depth ticks
+    for d in range(10, int(TOPDOWN_MAX_DEPTH_M) + 1, 10):
+        z_arr = np.array([[0.0, float(d)]], dtype=np.float32)
+        pt = _world_to_canvas(z_arr, frame_w, frame_h)
+        if pt is None:
+            continue
+        y = int(pt[0, 0, 1])
+        cv2.line(bev, (0, y), (frame_w - 1, y), (40, 40, 40), 1)
+        cv2.putText(bev, f"{d}m", (8, max(14, y - 3)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (150, 150, 150), 1, cv2.LINE_AA)
+
+    left_world = _lane_pts_to_ground(lane_result.get("left"), frame_w, frame_h) if lane_result else None
+    right_world = _lane_pts_to_ground(lane_result.get("right"), frame_w, frame_h) if lane_result else None
+
+    # Draw ego lane boundaries from EgoLanes
+    left_canvas = _world_to_canvas(left_world, frame_w, frame_h)
+    right_canvas = _world_to_canvas(right_world, frame_w, frame_h)
+    if left_canvas is not None:
+        cv2.polylines(bev, [left_canvas], False, (0, 255, 255), 3, cv2.LINE_AA)
+    if right_canvas is not None:
+        cv2.polylines(bev, [right_canvas], False, (0, 200, 255), 3, cv2.LINE_AA)
+
+    # Draw adjacent lanes by shifting ego lane assumptions by typical lane width.
+    for n in (1, 2):
+        if left_world is not None:
+            shifted = _shift_lane_x(left_world, -TOPDOWN_EGO_LANE_WIDTH_M * n)
+            shifted_canvas = _world_to_canvas(shifted, frame_w, frame_h)
+            if shifted_canvas is not None:
+                cv2.polylines(bev, [shifted_canvas], False, (100, 100, 100), 1, cv2.LINE_AA)
+        if right_world is not None:
+            shifted = _shift_lane_x(right_world, TOPDOWN_EGO_LANE_WIDTH_M * n)
+            shifted_canvas = _world_to_canvas(shifted, frame_w, frame_h)
+            if shifted_canvas is not None:
+                cv2.polylines(bev, [shifted_canvas], False, (100, 100, 100), 1, cv2.LINE_AA)
+
+    # Ego vehicle marker
+    ego_pt = _world_to_canvas(np.array([[0.0, 2.0]], dtype=np.float32), frame_w, frame_h)
+    if ego_pt is not None:
+        ex, ey = int(ego_pt[0, 0, 0]), int(ego_pt[0, 0, 1])
+        cv2.rectangle(bev, (ex - 12, ey - 18), (ex + 12, ey + 18), (60, 220, 60), -1)
+        cv2.putText(bev, f"EGO {ego_kmh * KMH_TO_MPH:.0f}mph", (ex - 48, ey + 35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 255, 220), 1, cv2.LINE_AA)
+
+    # Other vehicles from bbox bottom-center projected to ground
+    ego_mph = ego_kmh * KMH_TO_MPH
+    for x1, y1, x2, y2, cls_id, tid in tracked:
+        p = _pixel_to_ground((x1 + x2) * 0.5, y2, frame_w, frame_h)
+        if p is None:
+            continue
+        veh_world = np.array([[p[0], p[1]]], dtype=np.float32)
+        veh_canvas = _world_to_canvas(veh_world, frame_w, frame_h)
+        if veh_canvas is None:
+            continue
+
+        vx, vy = int(veh_canvas[0, 0, 0]), int(veh_canvas[0, 0, 1])
+        label_name = VEHICLE_CLASSES.get(cls_id, "VEH")
+        color = (180, 180, 180)
+        txt = label_name
+
+        if tid in _tracker_ref and len(_tracker_ref[tid]["history"]) >= 2:
+            spd_kmh, raw_kmh, _ = estimate_speed(_tracker_ref[tid]["history"], frame_w, ego_kmh)
+            if spd_kmh is not None:
+                spd_mph = spd_kmh * KMH_TO_MPH
+                raw_mph = raw_kmh * KMH_TO_MPH
+                diff_mph = spd_mph - ego_mph
+                color = _box_color(diff_mph, raw_mph)
+                sign = "+" if diff_mph >= 0 else ""
+                txt = f"{label_name} {spd_mph:.0f} ({sign}{diff_mph:.0f})"
+
+        cv2.rectangle(bev, (vx - 8, vy - 12), (vx + 8, vy + 12), color, -1)
+        cv2.putText(bev, txt, (vx + 10, vy - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (235, 235, 235), 1, cv2.LINE_AA)
+
+    cv2.putText(bev, f"TOP-DOWN ASSUMED VIEW  FOV {CAMERA_FOV_DEG:.0f}deg",
+                (12, 24), cv2.FONT_HERSHEY_DUPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+    return bev
 
 
 def extract_gps(video_path, csv_path):
@@ -515,7 +679,7 @@ def overlay_info(frame, gps_time_display, time_display, lat, lon, speed_kmh):
         cv2.putText(frame, text, (x, y), font, fs, (255, 255, 255), th, cv2.LINE_AA)
         x += w + gap
 
-def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sahi_model, lane_sess, writer):
+def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sahi_model, lane_sess, writer, writer2):
     """Play a single video with GPS overlay and vehicle detection."""
     global _tracker_ref
     print(f"[{file_idx}/{total_files}] Loading: {os.path.basename(video_path)}")
@@ -540,6 +704,7 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
     win = "Dashcam Player"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    show_topdown = False
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -579,8 +744,9 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
 
         # Lane detection (drawn first so vehicle boxes appear on top)
         fh, fw = frame.shape[:2]
+        lane_result = {"left": None, "right": None}
         if lane_sess is not None:
-            detect_and_draw_lanes(frame, lane_sess)
+            lane_result = detect_and_draw_lanes(frame, lane_sess)
 
         # Vehicle detection + tracking + speed overlay
         timestamp_s = frame_idx / fps
@@ -589,21 +755,28 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
         draw_vehicles(frame, tracked, fw, interp_speed)
         draw_bottom_banner(frame, tracked, fw, interp_speed)
 
+        topdown = draw_top_down_view(fw, fh, tracked, lane_result, interp_speed)
+
         # File index indicator (top-right)
         fname = f"{file_idx}/{total_files}: {os.path.basename(video_path)}"
         cv2.putText(frame, fname, (fw - 700, 50), cv2.FONT_HERSHEY_SIMPLEX,
                     0.8, (200, 200, 0), 2, cv2.LINE_AA)
 
-        display = fit_frame(frame, screen_w, screen_h)
+        display_frame = topdown if show_topdown else frame
+        display = fit_frame(display_frame, screen_w, screen_h)
         cv2.imshow(win, display)
         if writer is not None:
             writer.write(frame)
+        if writer2 is not None:
+            writer2.write(topdown)
 
         key = cv2.waitKey(delay_ms) & 0xFF
         if key == ord('q'):
             return False   # quit entirely
         if key == ord('n'):
             break          # skip to next video
+        if key == ord('d'):
+            show_topdown = not show_topdown
 
     cap.release()
     return True  # continue to next
@@ -631,7 +804,7 @@ def main():
         return
 
     print(f"Found {len(mp4_files)} MP4 file(s).")
-    print("Controls: [Q] Quit  [N] Next video\n")
+    print("Controls: [Q] Quit  [N] Next video  [D] Toggle camera/top-down display\n")
 
     screen_w, screen_h = get_screen_resolution()
     print(f"Screen resolution: {screen_w}x{screen_h}")
@@ -663,17 +836,22 @@ def main():
     out_fps = probe.get(cv2.CAP_PROP_FPS) or 30.0
     probe.release()
     out_path = os.path.join(os.getcwd(), "output.mp4")
+    out2_path = os.path.join(os.getcwd(), "output2.m4v")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(out_path, fourcc, out_fps, (out_w, out_h))
-    print(f"Writing processed video to: {out_path}\n")
+    writer2 = cv2.VideoWriter(out2_path, fourcc, out_fps, (out_w, out_h))
+    print(f"Writing processed camera view to: {out_path}")
+    print(f"Writing processed top-down view to: {out2_path}\n")
 
     for i, video_path in enumerate(mp4_files, start=1):
         if not play_video(video_path, screen_w, screen_h, len(mp4_files), i,
-                          model, sahi_model, lane_sess, writer):
+                          model, sahi_model, lane_sess, writer, writer2):
             break
 
     writer.release()
+    writer2.release()
     print(f"\nSaved: {out_path}")
+    print(f"Saved: {out2_path}")
 
     cv2.destroyAllWindows()
 
