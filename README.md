@@ -18,9 +18,7 @@ https://github.com/autowarefoundation/auto_speed
 
 ## EgoLanes
 
-https://github.com/autowarefoundation/vision_pilot/tree/e45165837e847f2ca5e5df5247cb4167379ecfc7/Models/model_library/EgoLanes
-
-visualisation
+ref visualisation
 https://github.com/autowarefoundation/vision_pilot/tree/e45165837e847f2ca5e5df5247cb4167379ecfc7/Models/visualizations/EgoLanes
 
 ## Monocular Depth
