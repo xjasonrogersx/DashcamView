@@ -160,6 +160,63 @@ def draw_lane_overlay(frame, lane_result):
 	draw_mask_contours(roi, class_mask, crop_w, crop_h)
 
 
+def fit_and_draw_lane_polynomials(frame, lane_result):
+	"""Fit x=f(y) polynomials for each lane blob and render them."""
+	if not lane_result:
+		return
+
+	x_off, y_off = lane_result["crop_offset"]
+	crop_w, crop_h = lane_result["crop_size"]
+	mask_hw = lane_result["class_mask"]
+
+	scale_x = crop_w / float(LANE_W)
+	scale_y = crop_h / float(LANE_H)
+
+	class_specs = [
+		(0, LANE_LEFT_COLOR, 3),
+		(1, LANE_RIGHT_COLOR, 3),
+		(2, OTHER_LANE_COLOR, 2),
+	]
+
+	for class_id, color, thickness in class_specs:
+		class_bin = (mask_hw == class_id).astype(np.uint8) * 255
+		if not np.any(class_bin):
+			continue
+
+		contours, _ = cv2.findContours(class_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		for contour in contours:
+			if cv2.contourArea(contour) < 40:
+				continue
+
+			comp_mask = np.zeros_like(class_bin)
+			cv2.drawContours(comp_mask, [contour], -1, 255, thickness=-1)
+			ys, xs = np.where(comp_mask > 0)
+			if len(xs) < 24:
+				continue
+
+			# Fit x as a function of y (second-order) in model space.
+			coeffs = np.polyfit(ys.astype(np.float32), xs.astype(np.float32), 2)
+			y_min = int(np.min(ys))
+			y_max = int(np.max(ys))
+			y_vals = np.arange(y_min, y_max + 1, 3, dtype=np.float32)
+			x_vals = np.polyval(coeffs, y_vals)
+
+			poly_pts = []
+			for x_m, y_m in zip(x_vals, y_vals):
+				if x_m < 0 or x_m >= LANE_W:
+					continue
+				x_px = int(round(x_off + x_m * scale_x))
+				y_px = int(round(y_off + y_m * scale_y))
+				if 0 <= x_px < frame.shape[1] and 0 <= y_px < frame.shape[0]:
+					poly_pts.append((x_px, y_px))
+
+			if len(poly_pts) >= 2:
+				arr = np.array(poly_pts, dtype=np.int32).reshape(-1, 1, 2)
+				cv2.polylines(frame, [arr], False, color, thickness, cv2.LINE_AA)
+				for p in poly_pts[::12]:
+					cv2.circle(frame, p, 2, color, -1, cv2.LINE_AA)
+
+
 def estimate_lane_center_offset_m(lane_result, frame_w, assumed_lane_width_m=3.7):
 	left_bottom_x = lane_result.get("left_bottom_x")
 	right_bottom_x = lane_result.get("right_bottom_x")
@@ -174,7 +231,7 @@ def estimate_lane_center_offset_m(lane_result, frame_w, assumed_lane_width_m=3.7
 	return (px_offset / max(frame_w * 0.5, 1.0)) * (assumed_lane_width_m * 0.5)
 
 
-def draw_overlay(frame, lane_result, ego_kmh, gps_time_display, elapsed_display, file_label):
+def draw_overlay(frame, lane_result, ego_kmh, gps_time_display, elapsed_display, file_label, view_mode):
 	fh, fw = frame.shape[:2]
 	ego_mph = ego_kmh * KMH_TO_MPH
 	lane_offset_m = estimate_lane_center_offset_m(lane_result, fw) if lane_result else None
@@ -192,6 +249,8 @@ def draw_overlay(frame, lane_result, ego_kmh, gps_time_display, elapsed_display,
 				cv2.FONT_HERSHEY_SIMPLEX, 0.72, (220, 220, 220), 2, cv2.LINE_AA)
 	cv2.putText(frame, f"TIME: {gps_time_display}  ELAPSED: {elapsed_display}", (20, 90),
 				cv2.FONT_HERSHEY_SIMPLEX, 0.58, (190, 190, 190), 1, cv2.LINE_AA)
+	cv2.putText(frame, f"VIEW: {view_mode}", (fw - 220, 90),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 220, 0), 2, cv2.LINE_AA)
 	cv2.putText(frame, file_label, (fw - 720, 38), cv2.FONT_HERSHEY_SIMPLEX,
 				0.8, (200, 200, 0), 2, cv2.LINE_AA)
 
@@ -213,6 +272,7 @@ def play_video(video_path, total_files, idx, egolanes, screen_w, screen_h):
 	cap = cv2.VideoCapture(video_path)
 	fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 	delay_ms = max(1, int(1000 / fps))
+	show_fit_polys = False
 
 	win = "EgoLanes Player"
 	cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -251,10 +311,15 @@ def play_video(video_path, total_files, idx, egolanes, screen_w, screen_h):
 			ego_kmh = 0.0
 
 		lane_result = egolanes.infer(frame, crop_rect=crop_rect)
-		draw_lane_overlay(frame, lane_result)
+		if show_fit_polys:
+			fit_and_draw_lane_polynomials(frame, lane_result)
+			view_mode = "POLY FIT"
+		else:
+			draw_lane_overlay(frame, lane_result)
+			view_mode = "MASK"
 
 		file_label = f"{idx}/{total_files}: {os.path.basename(video_path)}"
-		draw_overlay(frame, lane_result, ego_kmh, gps_time_display, elapsed, file_label)
+		draw_overlay(frame, lane_result, ego_kmh, gps_time_display, elapsed, file_label, view_mode)
 
 		disp = fit_frame(frame, screen_w, screen_h)
 		cv2.imshow(win, disp)
@@ -265,6 +330,8 @@ def play_video(video_path, total_files, idx, egolanes, screen_w, screen_h):
 			return False
 		if key == ord("n"):
 			break
+		if key == ord("f"):
+			show_fit_polys = not show_fit_polys
 
 	cap.release()
 	return True
@@ -283,7 +350,7 @@ def main():
 		return
 
 	print(f"Found {len(videos)} MP4 file(s).")
-	print("Controls: [Q] Quit  [N] Next video")
+	print("Controls: [Q] Quit  [N] Next video  [F] Toggle mask/poly-fit view")
 	print("Reference: https://github.com/autowarefoundation/vision_pilot/tree/e45165837e847f2ca5e5df5247cb4167379ecfc7/Models/visualizations/EgoLanes")
 
 	egolanes = EgoLanesONNX(model_path)
