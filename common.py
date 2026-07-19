@@ -16,22 +16,63 @@ DEFAULT_GENERATED_OUTPUT_NAMES = frozenset({
 
 def get_lower_2to1_crop(frame_w, frame_h):
     """Return an inference crop with 2:1 aspect ratio, biased to lower frame."""
-    target_h = int(round(frame_w / 2.0))
-    if target_h <= frame_h:
-        return 0, frame_h - target_h, frame_w, target_h
-
-    crop_h = frame_h
-    crop_w = min(frame_w, int(round(frame_h * 2.0)))
-    x0 = max(0, (frame_w - crop_w) // 2)
-    return x0, 0, crop_w, crop_h
+    return get_aspect_crop(frame_w, frame_h, 2, 1)
 
 
-def draw_crop_box(frame, crop_rect):
+def get_aspect_crop(frame_w, frame_h, net_w, net_h):
+    """Return the largest crop matching net_w:net_h aspect ratio, lower-biased."""
+    aspect = net_w / net_h
+    crop_w_from_full_h = int(round(frame_h * aspect))
+    if crop_w_from_full_h <= frame_w:
+        # Full height fits; crop width, centre horizontally
+        x0 = max(0, (frame_w - crop_w_from_full_h) // 2)
+        return x0, 0, crop_w_from_full_h, frame_h
+    # Full width fits; crop height, bias to bottom
+    crop_h = int(round(frame_w / aspect))
+    crop_h = min(crop_h, frame_h)
+    return 0, frame_h - crop_h, frame_w, crop_h
+
+
+def get_native_crop(frame_w, frame_h, net_w, net_h):
+    """Return a crop of exactly net_w x net_h pixels, centred horizontally, lower-biased vertically."""
+    cw = min(net_w, frame_w)
+    ch = min(net_h, frame_h)
+    x0 = max(0, (frame_w - cw) // 2)
+    y0 = max(0, frame_h - ch)
+    return x0, y0, cw, ch
+
+
+def get_crop_at_center(frame_w, frame_h, net_w, net_h, cx, cy, native=False):
+    """Return a crop centred at (cx, cy) in frame coords, clamped to frame bounds.
+    If native=True the crop is net_w x net_h pixels; otherwise the largest crop
+    that matches the net_w:net_h aspect ratio is used."""
+    if native:
+        cw = min(net_w, frame_w)
+        ch = min(net_h, frame_h)
+    else:
+        aspect = net_w / net_h
+        # largest crop matching aspect that fits the frame
+        cw_from_h = int(round(frame_h * aspect))
+        if cw_from_h <= frame_w:
+            cw, ch = cw_from_h, frame_h
+        else:
+            ch = int(round(frame_w / aspect))
+            ch = min(ch, frame_h)
+            cw = frame_w
+    x0 = cx - cw // 2
+    y0 = cy - ch // 2
+    x0 = max(0, min(frame_w - cw, x0))
+    y0 = max(0, min(frame_h - ch, y0))
+    return x0, y0, cw, ch
+
+
+def draw_crop_box(frame, crop_rect, label=None):
     """Visualize the active inference crop in grey."""
     x0, y0, cw, ch = crop_rect
     cv2.rectangle(frame, (x0, y0), (x0 + cw, y0 + ch), (140, 140, 140), 2, cv2.LINE_AA)
-    cv2.putText(frame, "2:1 inference crop", (x0 + 8, max(18, y0 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 170), 2, cv2.LINE_AA)
+    if label is not None:
+        cv2.putText(frame, label, (x0 + 8, max(18, y0 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (170, 170, 170), 2, cv2.LINE_AA)
 
 
 def discover_input_videos(base_dir, generated_output_names=None):

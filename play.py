@@ -5,7 +5,6 @@ import argparse
 import numpy as np
 from collections import deque
 from datetime import datetime, timedelta
-from scipy.special import softmax as scipy_softmax
 from ensemble_boxes import weighted_boxes_fusion
 import onnxruntime as ort
 from ultralytics import YOLO
@@ -27,6 +26,14 @@ VEHICLE_CLASSES = {2: "CAR", 3: "MOTO", 5: "BUS", 7: "TRUCK"}
 # Assumed real-world heights in metres per class (for distance estimation)
 VEHICLE_HEIGHT_M = {2: 1.5, 3: 1.2, 5: 3.0, 7: 2.5}
 
+# Approximate top-down footprint dimensions per class: (width_m, length_m)
+VEHICLE_FOOTPRINT_M = {
+    2: (1.9, 4.5),   # car
+    3: (0.8, 2.2),   # moto
+    5: (2.6, 12.0),  # bus
+    7: (2.8, 8.0),   # truck
+}
+
 # Bounding-box colours are now dynamic — see _box_color()
 
 # Speed history window (frames) for smoothing
@@ -37,7 +44,7 @@ KMH_TO_MPH = 0.621371
 # Camera / bird's-eye assumptions (until a monocular depth model is provided)
 CAMERA_FOV_DEG = 140.0
 TOPDOWN_HORIZON_FRAC = 0.42
-TOPDOWN_MAX_DEPTH_M = 80.0
+TOPDOWN_MAX_DEPTH_M = 30.0
 TOPDOWN_WIDTH_M = 24.0
 TOPDOWN_EGO_LANE_WIDTH_M = 3.7
 
@@ -365,14 +372,14 @@ _tracker_ref = {}
 # ── Lane detection ────────────────────────────────────────────────────────────
 
 LANE_W, LANE_H = 640, 320          # model input size
-LANE_THRESHOLD  = 0.35             # softmax probability threshold
-LANE_MIN_PTS    = 80               # minimum points to fit a polynomial
 LANE_START_Y    = 0.50             # only use bottom 50% (road area, avoid horizon)
 
 # Colors (BGR)
-LANE_LEFT_COLOR  = (0, 255, 255)   # yellow
-LANE_RIGHT_COLOR = (0, 200, 255)   # light orange
-LANE_FILL_COLOR  = (0, 200, 0)     # green fill between lanes
+LANE_LEFT_COLOR  = (255, 220, 0)
+LANE_RIGHT_COLOR = (0, 170, 255)
+LANE_FILL_COLOR  = (0, 210, 80)
+OTHER_LANE_COLOR = (180, 80, 255)
+BG_CLASS = 255
 
 
 def init_lane_model(model_path):
@@ -380,21 +387,125 @@ def init_lane_model(model_path):
     return ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
 
 
-def _fit_lane_poly(mask, min_y_frac=LANE_START_Y):
-    """
-    Fit a 2nd-degree polynomial (x = f(y)) to bright pixels in a lane mask.
-    Returns poly coefficients or None if insufficient data.
-    """
-    h, w = mask.shape
-    y_start = int(h * min_y_frac)
-    ys, xs = np.where(mask[y_start:] > 0)
-    ys = ys + y_start
-    if len(xs) < LANE_MIN_PTS:
+def logits_to_class_mask(logits_chw):
+    """Convert EgoLanes logits into VisionPilot class priorities."""
+    height, width = logits_chw.shape[1:]
+    mask = np.full((height, width), BG_CLASS, dtype=np.uint8)
+
+    c0 = logits_chw[0] > 0.0  # ego-left
+    c1 = logits_chw[1] > 0.0  # ego-right
+    c2 = logits_chw[2] > 0.0  # other lanes
+
+    mask[c2] = 2
+    mask[np.logical_and(~c2, c1)] = 1
+    mask[np.logical_and(~c2, np.logical_and(~c1, c0))] = 0
+    return mask
+
+
+def mask_to_color(mask_hw):
+    color = np.zeros((mask_hw.shape[0], mask_hw.shape[1], 3), dtype=np.uint8)
+    color[mask_hw == 2] = OTHER_LANE_COLOR
+    color[mask_hw == 1] = LANE_RIGHT_COLOR
+    color[mask_hw == 0] = LANE_LEFT_COLOR
+    return color
+
+
+def _class_mask_to_lane_points(mask_hw, class_id, start_y_frac=LANE_START_Y,
+                               row_step=2, min_row_pixels=2, min_points=20):
+    """Create a lane centerline as per-row mean x over the class mask."""
+    h, _ = mask_hw.shape
+    y_start = int(h * start_y_frac)
+    pts = []
+    for y in range(y_start, h, row_step):
+        xs = np.where(mask_hw[y] == class_id)[0]
+        if len(xs) < min_row_pixels:
+            continue
+        pts.append((float(np.mean(xs)), float(y)))
+
+    if len(pts) < min_points:
         return None
-    return np.polyfit(ys, xs, 2)
+    return np.array(pts, dtype=np.float32)
 
 
-def detect_and_draw_lanes(frame, lane_sess, draw_overlay=True, x_offset=0, y_offset=0):
+def _class_mask_to_raw_points(mask_hw, class_id, start_y_frac=LANE_START_Y, step=8):
+    """Downsampled raw lane-class points for debug plotting."""
+    h, _ = mask_hw.shape
+    y_start = int(h * start_y_frac)
+    ys, xs = np.where(mask_hw[y_start:] == class_id)
+    if len(xs) == 0:
+        return np.empty((0, 2), dtype=np.int32)
+    ys = ys + y_start
+    if len(xs) > step:
+        xs = xs[::step]
+        ys = ys[::step]
+    return np.stack([xs.astype(np.int32), ys.astype(np.int32)], axis=1)
+
+
+def draw_mask_contours(roi, mask_hw, crop_w, crop_h):
+    class_specs = [
+        (0, LANE_LEFT_COLOR, 3),
+        (1, LANE_RIGHT_COLOR, 3),
+        (2, OTHER_LANE_COLOR, 2),
+    ]
+    for class_id, color, thickness in class_specs:
+        class_mask = (mask_hw == class_id).astype(np.uint8) * 255
+        if not np.any(class_mask):
+            continue
+        resized_mask = cv2.resize(class_mask, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours(resized_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cv2.drawContours(roi, contours, -1, color, thickness, cv2.LINE_AA)
+
+
+def fit_and_draw_lane_polynomials(frame, class_mask, crop_w, crop_h):
+    """Fit x=f(y) polynomials per lane class and draw them on the ROI frame."""
+    class_specs = [
+        (0, LANE_LEFT_COLOR, 3),
+        (1, LANE_RIGHT_COLOR, 3),
+        (2, OTHER_LANE_COLOR, 2),
+    ]
+
+    for class_id, color, thickness in class_specs:
+        class_bin = (class_mask == class_id).astype(np.uint8) * 255
+        if not np.any(class_bin):
+            continue
+
+        contours, _ = cv2.findContours(class_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            if cv2.contourArea(contour) < 40:
+                continue
+
+            comp_mask = np.zeros_like(class_bin)
+            cv2.drawContours(comp_mask, [contour], -1, 255, thickness=-1)
+            ys, xs = np.where(comp_mask > 0)
+            if len(xs) < 24:
+                continue
+
+            coeffs = np.polyfit(ys.astype(np.float32), xs.astype(np.float32), 2)
+            y_min = int(np.min(ys))
+            y_max = int(np.max(ys))
+            y_vals = np.arange(y_min, y_max + 1, 3, dtype=np.float32)
+            x_vals = np.polyval(coeffs, y_vals)
+
+            scale_x = crop_w / float(LANE_W)
+            scale_y = crop_h / float(LANE_H)
+            poly_pts = []
+            for x_m, y_m in zip(x_vals, y_vals):
+                if x_m < 0 or x_m >= LANE_W:
+                    continue
+                x_px = int(round(x_m * scale_x))
+                y_px = int(round(y_m * scale_y))
+                if 0 <= x_px < frame.shape[1] and 0 <= y_px < frame.shape[0]:
+                    poly_pts.append((x_px, y_px))
+
+            if len(poly_pts) >= 2:
+                arr = np.array(poly_pts, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(frame, [arr], False, color, thickness, cv2.LINE_AA)
+                for p in poly_pts[::12]:
+                    cv2.circle(frame, p, 2, color, -1, cv2.LINE_AA)
+
+
+def detect_and_draw_lanes(frame, lane_sess, draw_overlay=True, x_offset=0, y_offset=0, draw_mode="mask"):
     """
     Run lane detection and draw left/right ego lane lines + fill onto frame in-place.
     Returns dict with frame-space lane points and raw points:
@@ -408,83 +519,70 @@ def detect_and_draw_lanes(frame, lane_sess, draw_overlay=True, x_offset=0, y_off
     inp = inp.transpose(2, 0, 1)[None]                      # HWC→NCHW
 
     # ── inference ───────────────────────────────────────────────────────────
-    out = lane_sess.run(["output"], {"input": inp})[0]       # [1,3,320,640]
-    probs = scipy_softmax(out[0], axis=0)                    # [3,320,640]
+    input_name = lane_sess.get_inputs()[0].name
+    output_name = lane_sess.get_outputs()[0].name
+    out = lane_sess.run([output_name], {input_name: inp})[0]  # [1,3,320,640]
+    class_mask = logits_to_class_mask(out[0])
 
-    left_mask  = (probs[0] > LANE_THRESHOLD).astype(np.uint8)
-    right_mask = (probs[1] > LANE_THRESHOLD).astype(np.uint8)
-
-    # ── fit polynomials ─────────────────────────────────────────────────────
-    poly_l = _fit_lane_poly(left_mask)
-    poly_r = _fit_lane_poly(right_mask)
-
-    y_start_model = int(LANE_H * LANE_START_Y)
-    ys_model = np.arange(y_start_model, LANE_H)
-
-    # Clip drawing range at the vanishing point (where polys intersect)
-    if poly_l is not None and poly_r is not None:
-        diff = poly_l - poly_r
-        roots = np.roots(diff)
-        real_roots = roots[np.isreal(roots)].real
-        valid = real_roots[(real_roots > y_start_model) & (real_roots < LANE_H)]
-        if len(valid) > 0:
-            y_start_model = int(np.max(valid)) + 1  # start just below crossing
-            ys_model = np.arange(y_start_model, LANE_H)
+    left_model = _class_mask_to_lane_points(class_mask, 0)
+    right_model = _class_mask_to_lane_points(class_mask, 1)
+    left_raw_model = _class_mask_to_raw_points(class_mask, 0)
+    right_raw_model = _class_mask_to_raw_points(class_mask, 1)
 
     scale_x = fw / LANE_W
     scale_y = fh / LANE_H
 
-    def model_to_frame_pts(poly, ys):
-        xs = np.polyval(poly, ys)
-        pts_x = (xs  * scale_x).astype(int)
-        pts_y = (ys  * scale_y).astype(int)
-        return np.stack([pts_x, pts_y], axis=1)
+    def model_pts_to_frame_pts(pts_model):
+        if pts_model is None or len(pts_model) == 0:
+            return None
+        pts = pts_model.copy()
+        pts[:, 0] = pts[:, 0] * scale_x
+        pts[:, 1] = pts[:, 1] * scale_y
+        return pts.astype(np.int32)
 
-    def mask_to_frame_raw(mask, step=8):
-        y_start = int(LANE_H * LANE_START_Y)
-        ys, xs = np.where(mask[y_start:] > 0)
-        if len(xs) == 0:
+    def model_raw_to_frame_raw(pts_model):
+        if pts_model is None or len(pts_model) == 0:
             return np.empty((0, 2), dtype=np.int32)
-        ys = ys + y_start
-        # Downsample points to keep debug overlay lightweight.
-        if len(xs) > step:
-            xs = xs[::step]
-            ys = ys[::step]
-        pts_x = (xs * scale_x).astype(np.int32)
-        pts_y = (ys * scale_y).astype(np.int32)
-        return np.stack([pts_x, pts_y], axis=1)
+        pts = pts_model.astype(np.float32).copy()
+        pts[:, 0] = pts[:, 0] * scale_x
+        pts[:, 1] = pts[:, 1] * scale_y
+        return pts.astype(np.int32)
 
     pts_l = None
     pts_r = None
 
-    left_raw = mask_to_frame_raw(left_mask)
-    right_raw = mask_to_frame_raw(right_mask)
+    left_raw = model_raw_to_frame_raw(left_raw_model)
+    right_raw = model_raw_to_frame_raw(right_raw_model)
+    pts_l = model_pts_to_frame_pts(left_model)
+    pts_r = model_pts_to_frame_pts(right_model)
 
-    # ── draw fill between lanes ─────────────────────────────────────────────
-    if draw_overlay and poly_l is not None and poly_r is not None:
-        pts_l = model_to_frame_pts(poly_l, ys_model)
-        pts_r = model_to_frame_pts(poly_r, ys_model)
-        # Only fill if left stays left of right (sanity check)
-        if pts_l[:, 0].mean() < pts_r[:, 0].mean():
-            fill_pts = np.vstack([pts_l, pts_r[::-1]])
-            overlay = frame.copy()
-            cv2.fillPoly(overlay, [fill_pts], LANE_FILL_COLOR)
-            cv2.addWeighted(overlay, 0.18, frame, 0.82, 0, frame)
+    if draw_overlay and draw_mode == "mask":
+        color_mask = mask_to_color(class_mask)
+        color_overlay = cv2.resize(color_mask, (fw, fh), interpolation=cv2.INTER_NEAREST)
 
-    if not draw_overlay:
-        if poly_l is not None:
-            pts_l = model_to_frame_pts(poly_l, ys_model)
-        if poly_r is not None:
-            pts_r = model_to_frame_pts(poly_r, ys_model)
+        left_mask = cv2.resize((class_mask == 0).astype(np.uint8), (fw, fh), interpolation=cv2.INTER_NEAREST)
+        right_mask = cv2.resize((class_mask == 1).astype(np.uint8), (fw, fh), interpolation=cv2.INTER_NEAREST)
+        other_mask = cv2.resize((class_mask == 2).astype(np.uint8), (fw, fh), interpolation=cv2.INTER_NEAREST)
 
-    # ── draw lane lines ──────────────────────────────────────────────────────
-    if draw_overlay:
-        for poly, color in [(poly_l, LANE_LEFT_COLOR), (poly_r, LANE_RIGHT_COLOR)]:
-            if poly is None:
-                continue
-            pts = model_to_frame_pts(poly, ys_model).reshape(-1, 1, 2)
-            cv2.polylines(frame, [pts], isClosed=False, color=color,
-                          thickness=4, lineType=cv2.LINE_AA)
+        overlay = frame.copy()
+        overlay[left_mask > 0] = cv2.addWeighted(frame[left_mask > 0], 0.30, color_overlay[left_mask > 0], 0.70, 0)
+        overlay[right_mask > 0] = cv2.addWeighted(frame[right_mask > 0], 0.30, color_overlay[right_mask > 0], 0.70, 0)
+        overlay[other_mask > 0] = cv2.addWeighted(frame[other_mask > 0], 0.45, color_overlay[other_mask > 0], 0.55, 0)
+        cv2.addWeighted(overlay, 0.92, frame, 0.08, 0, frame)
+
+        if np.any(left_mask) and np.any(right_mask):
+            corridor = np.zeros((fh, fw), dtype=np.uint8)
+            corridor[np.logical_or(left_mask > 0, right_mask > 0)] = 255
+            kernel = np.ones((9, 9), dtype=np.uint8)
+            corridor = cv2.morphologyEx(corridor, cv2.MORPH_CLOSE, kernel)
+            corridor_bgr = np.zeros_like(frame)
+            corridor_bgr[corridor > 0] = LANE_FILL_COLOR
+            cv2.addWeighted(corridor_bgr, 0.16, frame, 0.84, 0, frame)
+
+        draw_mask_contours(frame, class_mask, fw, fh)
+
+    if draw_overlay and draw_mode == "poly":
+        fit_and_draw_lane_polynomials(frame, class_mask, fw, fh)
 
     if pts_l is not None:
         pts_l = pts_l.copy()
@@ -503,7 +601,13 @@ def detect_and_draw_lanes(frame, lane_sess, draw_overlay=True, x_offset=0, y_off
         right_raw[:, 0] += x_offset
         right_raw[:, 1] += y_offset
 
-    return {"left": pts_l, "right": pts_r, "left_raw": left_raw, "right_raw": right_raw}
+    return {
+        "left": pts_l,
+        "right": pts_r,
+        "left_raw": left_raw,
+        "right_raw": right_raw,
+        "class_mask": class_mask,
+    }
 
 
 def draw_raw_lane_debug(frame, lane_result):
@@ -557,7 +661,10 @@ def _world_to_canvas(points_xz, out_w, out_h):
     if points_xz is None or len(points_xz) == 0:
         return None
 
-    m_per_px_x = TOPDOWN_WIDTH_M / max(out_w, 1)
+    half_fov = np.deg2rad(CAMERA_FOV_DEG * 0.5)
+    half_span_fov = np.tan(half_fov) * TOPDOWN_MAX_DEPTH_M
+    half_span_m = max(TOPDOWN_WIDTH_M * 0.5, half_span_fov)
+    m_per_px_x = (2.0 * half_span_m) / max(out_w, 1)
     m_per_px_z = TOPDOWN_MAX_DEPTH_M / max(out_h - 20, 1)
     px = (out_w * 0.5 + points_xz[:, 0] / m_per_px_x).astype(np.int32)
     py = (out_h - 10 - points_xz[:, 1] / m_per_px_z).astype(np.int32)
@@ -567,9 +674,21 @@ def _world_to_canvas(points_xz, out_w, out_h):
         (pts[:, 1] >= 0) & (pts[:, 1] < out_h)
     )
     pts = pts[in_bounds]
-    if len(pts) < 2:
+    if len(pts) < 1:
         return None
     return pts.reshape(-1, 1, 2)
+
+
+def _world_point_to_canvas(x_m, z_m, out_w, out_h):
+    """Project a single world point to BEV canvas coordinates."""
+    half_fov = np.deg2rad(CAMERA_FOV_DEG * 0.5)
+    half_span_fov = np.tan(half_fov) * TOPDOWN_MAX_DEPTH_M
+    half_span_m = max(TOPDOWN_WIDTH_M * 0.5, half_span_fov)
+    m_per_px_x = (2.0 * half_span_m) / max(out_w, 1)
+    m_per_px_z = TOPDOWN_MAX_DEPTH_M / max(out_h - 20, 1)
+    px = int(round(out_w * 0.5 + x_m / m_per_px_x))
+    py = int(round(out_h - 10 - z_m / m_per_px_z))
+    return px, py
 
 
 def _shift_lane_x(points_xz, shift_m):
@@ -582,53 +701,164 @@ def _shift_lane_x(points_xz, shift_m):
 
 
 def _draw_topdown_fov_funnel(bev, frame_w, frame_h):
-    """Draw a 140-degree field-of-view funnel in BEV space."""
+    """Draw a 140-degree field-of-view funnel in grey."""
     half_fov = np.deg2rad(CAMERA_FOV_DEG * 0.5)
     max_z = TOPDOWN_MAX_DEPTH_M
     edge_x = np.tan(half_fov) * max_z
 
-    apex = _world_to_canvas(np.array([[0.0, 0.0]], dtype=np.float32), frame_w, frame_h)
-    left = _world_to_canvas(np.array([[-edge_x, max_z]], dtype=np.float32), frame_w, frame_h)
-    right = _world_to_canvas(np.array([[edge_x, max_z]], dtype=np.float32), frame_w, frame_h)
-    if apex is None or left is None or right is None:
-        return
-
-    a = tuple(apex[0, 0])
-    l = tuple(left[0, 0])
-    r = tuple(right[0, 0])
+    a = _world_point_to_canvas(0.0, 0.0, frame_w, frame_h)
+    l = _world_point_to_canvas(-edge_x, max_z, frame_w, frame_h)
+    r = _world_point_to_canvas(edge_x, max_z, frame_w, frame_h)
     overlay = bev.copy()
     poly = np.array([a, l, r], dtype=np.int32).reshape(-1, 1, 2)
-    cv2.fillPoly(overlay, [poly], (45, 35, 18))
-    cv2.addWeighted(overlay, 0.22, bev, 0.78, 0, bev)
-    cv2.line(bev, a, l, (180, 150, 70), 2, cv2.LINE_AA)
-    cv2.line(bev, a, r, (180, 150, 70), 2, cv2.LINE_AA)
+    cv2.fillPoly(overlay, [poly], (58, 58, 58))
+    cv2.addWeighted(overlay, 0.20, bev, 0.80, 0, bev)
+    cv2.line(bev, a, l, (150, 150, 150), 2, cv2.LINE_AA)
+    cv2.line(bev, a, r, (150, 150, 150), 2, cv2.LINE_AA)
+
+
+def _draw_topdown_range_arcs(bev, out_w, out_h, step_m=10):
+    """Draw radial distance arcs every step_m inside FOV, with labels."""
+    half_fov = np.deg2rad(CAMERA_FOV_DEG * 0.5)
+    angles = np.linspace(-half_fov, half_fov, 140, dtype=np.float32)
+
+    for dist_m in range(step_m, int(TOPDOWN_MAX_DEPTH_M) + 1, step_m):
+        x = dist_m * np.sin(angles)
+        z = dist_m * np.cos(angles)
+        pts = np.array([_world_point_to_canvas(float(xi), float(zi), out_w, out_h) for xi, zi in zip(x, z)], dtype=np.int32)
+        pts = pts.reshape(-1, 1, 2)
+        cv2.polylines(bev, [pts], False, (95, 95, 95), 1, cv2.LINE_AA)
+
+        tx, ty = _world_point_to_canvas(0.0, float(dist_m), out_w, out_h)
+        cv2.putText(bev, f"{dist_m}m", (tx + 6, ty - 4), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42, (165, 165, 165), 1, cv2.LINE_AA)
+
+
+def _build_parallel_lane_world(left_world, right_world, assumed_lane_width_m=TOPDOWN_EGO_LANE_WIDTH_M):
+    """Generate smoother near-parallel lane boundaries for BEV rendering."""
+    if left_world is None and right_world is None:
+        return None, None
+
+    if left_world is not None:
+        left_world = left_world[np.argsort(left_world[:, 1])]
+    if right_world is not None:
+        right_world = right_world[np.argsort(right_world[:, 1])]
+
+    if left_world is not None and right_world is not None:
+        z_min = max(2.0, min(float(left_world[:, 1].min()), float(right_world[:, 1].min())))
+        z_max = TOPDOWN_MAX_DEPTH_M
+        if z_max <= z_min + 2.0 or len(left_world) < 6 or len(right_world) < 6:
+            return left_world, right_world
+
+        z_grid = np.linspace(z_min, z_max, 60, dtype=np.float32)
+        fit_l = np.polyfit(left_world[:, 1], left_world[:, 0], 1)
+        fit_r = np.polyfit(right_world[:, 1], right_world[:, 0], 1)
+        x_left = np.polyval(fit_l, z_grid)
+        x_right = np.polyval(fit_r, z_grid)
+        width = np.median(x_right - x_left)
+        width = float(np.clip(width, 2.8, 5.0))
+        center = 0.5 * (x_left + x_right)
+
+        if len(z_grid) >= 8:
+            line = np.polyfit(z_grid, center, 1)
+            center = np.polyval(line, z_grid)
+
+        left_fit = np.stack([center - width * 0.5, z_grid], axis=1)
+        right_fit = np.stack([center + width * 0.5, z_grid], axis=1)
+        return left_fit.astype(np.float32), right_fit.astype(np.float32)
+
+    if left_world is not None:
+        z_grid = np.linspace(max(2.0, float(left_world[:, 1].min())),
+                             TOPDOWN_MAX_DEPTH_M,
+                             60, dtype=np.float32)
+        if len(left_world) >= 6:
+            fit_l = np.polyfit(left_world[:, 1], left_world[:, 0], 1)
+            x_left = np.polyval(fit_l, z_grid)
+        else:
+            x_left = np.interp(z_grid, left_world[:, 1], left_world[:, 0])
+        right_fit = np.stack([x_left + assumed_lane_width_m, z_grid], axis=1)
+        left_fit = np.stack([x_left, z_grid], axis=1)
+        return left_fit.astype(np.float32), right_fit.astype(np.float32)
+
+    z_grid = np.linspace(max(2.0, float(right_world[:, 1].min())),
+                         TOPDOWN_MAX_DEPTH_M,
+                         60, dtype=np.float32)
+    if len(right_world) >= 6:
+        fit_r = np.polyfit(right_world[:, 1], right_world[:, 0], 1)
+        x_right = np.polyval(fit_r, z_grid)
+    else:
+        x_right = np.interp(z_grid, right_world[:, 1], right_world[:, 0])
+    left_fit = np.stack([x_right - assumed_lane_width_m, z_grid], axis=1)
+    right_fit = np.stack([x_right, z_grid], axis=1)
+    return left_fit.astype(np.float32), right_fit.astype(np.float32)
+
+
+def _draw_vehicle_bev_box(bev, x_m, z_m, cls_id, color):
+    """Draw class-sized axis-aligned top-down box in world coordinates."""
+    w_m, l_m = VEHICLE_FOOTPRINT_M.get(cls_id, (1.9, 4.5))
+    z0 = max(0.2, z_m - 0.5 * l_m)
+    z1 = min(TOPDOWN_MAX_DEPTH_M, z_m + 0.5 * l_m)
+    x0 = x_m - 0.5 * w_m
+    x1 = x_m + 0.5 * w_m
+
+    p1 = _world_point_to_canvas(x0, z0, bev.shape[1], bev.shape[0])
+    p2 = _world_point_to_canvas(x1, z0, bev.shape[1], bev.shape[0])
+    p3 = _world_point_to_canvas(x1, z1, bev.shape[1], bev.shape[0])
+    p4 = _world_point_to_canvas(x0, z1, bev.shape[1], bev.shape[0])
+    poly = np.array([p1, p2, p3, p4], dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(bev, [poly], True, color, 2, cv2.LINE_AA)
+
+
+def _draw_topdown_footprint_legend(bev):
+    """Show assumed class footprint sizes used for BEV boxes."""
+    x0, y0 = 12, 54
+    line_h = 18
+    panel_w = 250
+    panel_h = line_h * 6 + 12
+
+    overlay = bev.copy()
+    cv2.rectangle(overlay, (x0 - 8, y0 - 20), (x0 + panel_w, y0 + panel_h), (22, 22, 22), -1)
+    cv2.addWeighted(overlay, 0.55, bev, 0.45, 0, bev)
+    cv2.rectangle(bev, (x0 - 8, y0 - 20), (x0 + panel_w, y0 + panel_h), (90, 90, 90), 1)
+
+    cv2.putText(bev, "BEV box assumptions (W x L m)", (x0, y0 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 210, 210), 1, cv2.LINE_AA)
+
+    rows = [
+        (2, "CAR"),
+        (3, "MOTO"),
+        (5, "BUS"),
+        (7, "TRUCK"),
+    ]
+    for i, (cls_id, label) in enumerate(rows, start=1):
+        w_m, l_m = VEHICLE_FOOTPRINT_M[cls_id]
+        txt = f"{label:5s}: {w_m:.1f} x {l_m:.1f}"
+        cv2.putText(bev, txt, (x0, y0 + i * line_h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (185, 185, 185), 1, cv2.LINE_AA)
 
 
 def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
-    """Build a top-down assumed-position view using FOV-based geometry."""
+    """Build a top-down plot with FOV wedge, range arcs, lanes, and class-sized boxes."""
     bev = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
 
     # Road background gradient
     for y in range(frame_h):
         t = y / max(frame_h - 1, 1)
-        shade = int(18 + 28 * (1.0 - t))
+        shade = int(16 + 22 * (1.0 - t))
         bev[y, :] = (shade, shade, shade)
 
     _draw_topdown_fov_funnel(bev, frame_w, frame_h)
+    _draw_topdown_range_arcs(bev, frame_w, frame_h, step_m=10)
 
-    # Depth ticks
-    for d in range(10, int(TOPDOWN_MAX_DEPTH_M) + 1, 10):
-        z_arr = np.array([[0.0, float(d)]], dtype=np.float32)
-        pt = _world_to_canvas(z_arr, frame_w, frame_h)
-        if pt is None:
-            continue
-        y = int(pt[0, 0, 1])
-        cv2.line(bev, (0, y), (frame_w - 1, y), (40, 40, 40), 1)
-        cv2.putText(bev, f"{d}m", (8, max(14, y - 3)), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (150, 150, 150), 1, cv2.LINE_AA)
+    cv2.putText(bev, "Distance (m)", (frame_w // 2 - 58, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (195, 195, 195), 1, cv2.LINE_AA)
+    cv2.putText(bev, f"TOP-DOWN PLOT  FOV {CAMERA_FOV_DEG:.0f}deg",
+                (12, 36), cv2.FONT_HERSHEY_DUPLEX, 0.58, (220, 220, 220), 1, cv2.LINE_AA)
+    _draw_topdown_footprint_legend(bev)
 
     left_world = _lane_pts_to_ground(lane_result.get("left"), frame_w, frame_h) if lane_result else None
     right_world = _lane_pts_to_ground(lane_result.get("right"), frame_w, frame_h) if lane_result else None
+    left_world, right_world = _build_parallel_lane_world(left_world, right_world)
 
     # Draw ego lane boundaries from EgoLanes
     left_canvas = _world_to_canvas(left_world, frame_w, frame_h)
@@ -652,9 +882,8 @@ def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
                 cv2.polylines(bev, [shifted_canvas], False, (100, 100, 100), 1, cv2.LINE_AA)
 
     # Ego vehicle marker
-    ego_pt = _world_to_canvas(np.array([[0.0, 2.0]], dtype=np.float32), frame_w, frame_h)
-    if ego_pt is not None:
-        ex, ey = int(ego_pt[0, 0, 0]), int(ego_pt[0, 0, 1])
+    ex, ey = _world_point_to_canvas(0.0, 2.0, frame_w, frame_h)
+    if 0 <= ex < frame_w and 0 <= ey < frame_h:
         cv2.rectangle(bev, (ex - 12, ey - 18), (ex + 12, ey + 18), (60, 220, 60), -1)
         cv2.putText(bev, f"EGO {ego_kmh * KMH_TO_MPH:.0f}mph", (ex - 48, ey + 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 255, 220), 1, cv2.LINE_AA)
@@ -665,12 +894,9 @@ def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
         p = _pixel_to_ground((x1 + x2) * 0.5, y2, frame_w, frame_h)
         if p is None:
             continue
-        veh_world = np.array([[p[0], p[1]]], dtype=np.float32)
-        veh_canvas = _world_to_canvas(veh_world, frame_w, frame_h)
-        if veh_canvas is None:
+        vx, vy = _world_point_to_canvas(float(p[0]), float(p[1]), frame_w, frame_h)
+        if not (0 <= vx < frame_w and 0 <= vy < frame_h):
             continue
-
-        vx, vy = int(veh_canvas[0, 0, 0]), int(veh_canvas[0, 0, 1])
         label_name = VEHICLE_CLASSES.get(cls_id, "VEH")
         color = (180, 180, 180)
         txt = label_name
@@ -685,15 +911,10 @@ def draw_top_down_view(frame_w, frame_h, tracked, lane_result, ego_kmh):
                 sign = "+" if diff_mph >= 0 else ""
                 txt = f"{label_name} {spd_mph:.0f} ({sign}{diff_mph:.0f})"
 
-        # Use oriented-ish box dimensions by distance assumption (closer appears larger).
-        box_w = max(8, int(18 - 0.12 * p[1]))
-        box_h = max(12, int(26 - 0.18 * p[1]))
-        cv2.rectangle(bev, (vx - box_w, vy - box_h), (vx + box_w, vy + box_h), color, 2)
+        _draw_vehicle_bev_box(bev, float(p[0]), float(p[1]), cls_id, color)
         cv2.putText(bev, txt, (vx + 10, vy - 4), cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (235, 235, 235), 1, cv2.LINE_AA)
 
-    cv2.putText(bev, f"TOP-DOWN ASSUMED VIEW  FOV {CAMERA_FOV_DEG:.0f}deg",
-                (12, 24), cv2.FONT_HERSHEY_DUPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
     return bev
 
 
@@ -726,7 +947,7 @@ def overlay_info(frame, gps_time_display, time_display, lat, lon, speed_kmh):
 
 def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sahi_model, lane_sess, writer, writer2):
     """Play a single video with GPS overlay and vehicle detection."""
-    global _tracker_ref
+    global _tracker_ref, TOPDOWN_MAX_DEPTH_M
     print(f"[{file_idx}/{total_files}] Loading: {os.path.basename(video_path)}")
 
     with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -753,6 +974,7 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
     yolo_enabled = True
     ego_enabled = True
     raw_lane_debug = False
+    lane_fit_polys = False
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -796,10 +1018,18 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
         draw_crop_box(frame, crop_rect)
 
         lane_result = {"left": None, "right": None, "left_raw": np.empty((0, 2), dtype=np.int32), "right_raw": np.empty((0, 2), dtype=np.int32)}
+        lane_mode = "POLY" if lane_fit_polys else "MASK"
         if ego_enabled and lane_sess is not None:
             cx, cy, cw, ch = crop_rect
             lane_roi = frame[cy:cy + ch, cx:cx + cw]
-            lane_result = detect_and_draw_lanes(lane_roi, lane_sess, draw_overlay=True, x_offset=cx, y_offset=cy)
+            lane_result = detect_and_draw_lanes(
+                lane_roi,
+                lane_sess,
+                draw_overlay=True,
+                x_offset=cx,
+                y_offset=cy,
+                draw_mode=("poly" if lane_fit_polys else "mask"),
+            )
             if raw_lane_debug:
                 draw_raw_lane_debug(frame, lane_result)
 
@@ -818,7 +1048,14 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
         fname = f"{file_idx}/{total_files}: {os.path.basename(video_path)}"
         cv2.putText(frame, fname, (fw - 700, 50), cv2.FONT_HERSHEY_SIMPLEX,
                     0.8, (200, 200, 0), 2, cv2.LINE_AA)
-        status = f"D:Topdown {'ON' if show_topdown else 'OFF'}  Y:YOLO {'ON' if yolo_enabled else 'OFF'}  E:EgoLanes {'ON' if ego_enabled else 'OFF'}  R:RawLane {'ON' if raw_lane_debug else 'OFF'}"
+        status = (
+            f"D:Topdown {'ON' if show_topdown else 'OFF'}  "
+            f"Y:YOLO {'ON' if yolo_enabled else 'OFF'}  "
+            f"E:EgoLanes {'ON' if ego_enabled else 'OFF'}  "
+            f"R:RawLane {'ON' if raw_lane_debug else 'OFF'}  "
+            f"F:LaneMode {lane_mode}  "
+            f"<>:Depth {TOPDOWN_MAX_DEPTH_M:.0f}m"
+        )
         cv2.putText(frame, status, (16, fh - 16), cv2.FONT_HERSHEY_SIMPLEX,
                 0.62, (240, 240, 240), 2, cv2.LINE_AA)
 
@@ -843,6 +1080,13 @@ def play_video(video_path, screen_w, screen_h, total_files, file_idx, model, sah
             ego_enabled = not ego_enabled
         if key == ord('r'):
             raw_lane_debug = not raw_lane_debug
+        if key == ord('f'):
+            lane_fit_polys = not lane_fit_polys
+        # Support both shifted and unshifted keys on common keyboard layouts.
+        if key in (ord('>'), ord('.')):
+            TOPDOWN_MAX_DEPTH_M = min(200.0, TOPDOWN_MAX_DEPTH_M + 5.0)
+        if key in (ord('<'), ord(',')):
+            TOPDOWN_MAX_DEPTH_M = max(10.0, TOPDOWN_MAX_DEPTH_M - 5.0)
 
     cap.release()
     return True  # continue to next
@@ -869,7 +1113,7 @@ def main():
         return
 
     print(f"Found {len(mp4_files)} MP4 file(s).")
-    print("Controls: [Q] Quit  [N] Next video  [D] Toggle camera/top-down display  [Y] Toggle YOLO  [E] Toggle EgoLanes  [R] Toggle raw-lane debug\n")
+    print("Controls: [Q] Quit  [N] Next video  [D] Toggle camera/top-down display  [Y] Toggle YOLO  [E] Toggle EgoLanes  [R] Toggle raw-lane debug  [F] Toggle lane mask/poly-fit mode  [<]/[>] (or [,]/[.]) top-down depth -/+ 5m\n")
 
     screen_w, screen_h = get_screen_resolution()
     print(f"Screen resolution: {screen_w}x{screen_h}")

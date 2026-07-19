@@ -14,13 +14,19 @@ from common import (
 	draw_crop_box,
 	extract_gps,
 	fit_frame,
+	get_aspect_crop,
+	get_crop_at_center,
+	get_native_crop,
 	get_lower_2to1_crop,
 	get_screen_resolution,
 	load_gps,
 )
 
 
-MODEL_PATH = "models/autospeed.onnx"
+MODEL_PATHS = [
+	"models/autospeed.onnx",
+	"models/autospeed_2.onnx",
+]
 CONF_THRESH = 0.60
 IOU_THRESH = 0.45
 KMH_TO_MPH = 0.621371
@@ -94,6 +100,7 @@ def nms(boxes, scores, iou_thresh):
 
 class AutoSpeedONNX:
 	def __init__(self, onnx_path):
+		self.model_path = onnx_path
 		providers = ["CPUExecutionProvider"]
 		self.session = ort.InferenceSession(onnx_path, providers=providers)
 		self.input_name = self.session.get_inputs()[0].name
@@ -277,7 +284,7 @@ def draw_overlay(frame, tracked, tracks_ref, ego_kmh, gps_time_display, elapsed_
 					0.55, (0, 0, 0), 2, cv2.LINE_AA)
 
 
-def play_video(video_path, total_files, idx, autospeed, screen_w, screen_h):
+def play_video(video_path, total_files, idx, models, screen_w, screen_h):
 	print(f"[{idx}/{total_files}] Loading: {os.path.basename(video_path)}")
 
 	with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -296,10 +303,26 @@ def play_video(video_path, total_files, idx, autospeed, screen_w, screen_h):
 	delay_ms = max(1, int(1000 / fps))
 
 	tracker = Tracker()
+	model_idx = 0
+	native_crop = False  # False = maximised crop+resize, True = native pixel crop
+	crop_center = [None]  # [None] or [(fx, fy)] in frame coords
+	display_meta = [None]  # [(scale, x_off, y_off, fw, fh)] updated each frame
+
+	def on_mouse(event, mx, my, flags, param):
+		if event != cv2.EVENT_LBUTTONDOWN:
+			return
+		if display_meta[0] is None:
+			return
+		scale, x_off, y_off, fw, fh = display_meta[0]
+		fx = int((mx - x_off) / scale)
+		fy = int((my - y_off) / scale)
+		if 0 <= fx < fw and 0 <= fy < fh:
+			crop_center[0] = (fx, fy)
 
 	win = "AutoSpeed Player"
 	cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 	cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+	cv2.setMouseCallback(win, on_mouse)
 
 	while cap.isOpened():
 		ret, frame = cap.read()
@@ -307,8 +330,18 @@ def play_video(video_path, total_files, idx, autospeed, screen_w, screen_h):
 			break
 
 		fh, fw = frame.shape[:2]
-		crop_rect = get_lower_2to1_crop(fw, fh)
-		draw_crop_box(frame, crop_rect)
+		autospeed = models[model_idx]
+		if crop_center[0] is not None:
+			cx, cy = crop_center[0]
+			crop_rect = get_crop_at_center(fw, fh, autospeed.net_w, autospeed.net_h, cx, cy, native=native_crop)
+		elif native_crop:
+			crop_rect = get_native_crop(fw, fh, autospeed.net_w, autospeed.net_h)
+		else:
+			crop_rect = get_aspect_crop(fw, fh, autospeed.net_w, autospeed.net_h)
+		crop_mode = "native" if native_crop else "max"
+		crop_label = (f"{autospeed.net_w}x{autospeed.net_h} [{crop_mode}]  "
+					  f"[M] model {model_idx + 1}/{len(models)}  [C] crop  [click] recenter")
+		draw_crop_box(frame, crop_rect, label=crop_label)
 
 		frame_idx = cap.get(cv2.CAP_PROP_POS_FRAMES)
 		t_s = frame_idx / fps
@@ -338,6 +371,12 @@ def play_video(video_path, total_files, idx, autospeed, screen_w, screen_h):
 
 		draw_overlay(frame, tracked, tracker.tracks, ego_kmh, gps_time_display, elapsed)
 
+		# Update display transform metadata for mouse→frame mapping
+		scale = min(screen_w / fw, screen_h / fh)
+		x_off = (screen_w - int(fw * scale)) // 2
+		y_off = (screen_h - int(fh * scale)) // 2
+		display_meta[0] = (scale, x_off, y_off, fw, fh)
+
 		disp = fit_frame(frame, screen_w, screen_h)
 		cv2.imshow(win, disp)
 
@@ -347,6 +386,14 @@ def play_video(video_path, total_files, idx, autospeed, screen_w, screen_h):
 			return False
 		if key == ord("n"):
 			break
+		if key == ord("m"):
+			model_idx = (model_idx + 1) % len(models)
+			print(f"Switched to model {model_idx + 1}: {models[model_idx].model_path}")
+		if key == ord("c"):
+			native_crop = not native_crop
+			mode = "native pixel crop" if native_crop else "maximised crop + resize"
+			print(f"Crop mode: {mode}")
+			crop_center[0] = None  # reset to default position on mode change
 
 	cap.release()
 	return True
@@ -359,21 +406,32 @@ def main():
 		print("No source MP4 files found. Place videos in current directory or camera/.")
 		return
 
-	model_path = os.path.join(cwd, MODEL_PATH)
+	model_path = os.path.join(cwd, MODEL_PATHS[0])
 	if not os.path.exists(model_path):
 		print(f"Missing AutoSpeed model: {model_path}")
 		return
 
 	print(f"Found {len(videos)} MP4 file(s).")
-	print("Controls: [Q] Quit  [N] Next video")
+	print("Controls: [Q] Quit  [N] Next video  [M] Switch model")
 	print("Reference: https://github.com/autowarefoundation/auto_speed")
 
-	autospeed = AutoSpeedONNX(model_path)
+	models = []
+	for mp in MODEL_PATHS:
+		model_path = os.path.join(cwd, mp)
+		if not os.path.exists(model_path):
+			print(f"Skipping missing model: {model_path}")
+			continue
+		m = AutoSpeedONNX(model_path)
+		models.append(m)
+	if not models:
+		print("No AutoSpeed models found.")
+		return
+
 	screen_w, screen_h = get_screen_resolution()
 	print(f"Screen resolution: {screen_w}x{screen_h}")
 
 	for i, vp in enumerate(videos, start=1):
-		if not play_video(vp, len(videos), i, autospeed, screen_w, screen_h):
+		if not play_video(vp, len(videos), i, models, screen_w, screen_h):
 			break
 
 	cv2.destroyAllWindows()
