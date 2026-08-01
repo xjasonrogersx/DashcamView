@@ -252,6 +252,42 @@ def estimate_abs_speed_kmh(track_hist, frame_w, ego_kmh):
 	return max(0.0, ego_kmh + avg_rel * 3.6)
 
 
+def estimate_approach_rate(track_hist):
+	if len(track_hist) < 2:
+		return None
+
+	rates = []
+	for i in range(1, len(track_hist)):
+		h1, t1, c1 = track_hist[i - 1]
+		h2, t2, c2 = track_hist[i]
+		dt = t2 - t1
+		if dt <= 0 or h1 <= 0 or h2 <= 0:
+			continue
+		d1 = 1.0 / float(h1)
+		d2 = 1.0 / float(h2)
+		rates.append((d2 - d1) / dt)
+
+	if not rates:
+		return None
+	return sum(rates) / len(rates)
+
+
+def vehicle_display_color(track_hist, frame_w, ego_kmh):
+	"""Return BGR color for vehicle annotations.
+
+	Red means the object is approaching, green means it is moving faster than the ego
+	vehicle, and orange means it is slower.
+	"""
+	approach_rate = estimate_approach_rate(track_hist)
+	if approach_rate is not None and approach_rate < 0.0:
+		return (0, 0, 255)
+
+	spd_kmh = estimate_abs_speed_kmh(track_hist, frame_w, ego_kmh)
+	if spd_kmh is not None and spd_kmh > ego_kmh:
+		return (0, 220, 0)
+	return (0, 165, 255)
+
+
 def class_name(cls_id):
 	return f"L{cls_id}"
 
@@ -267,13 +303,14 @@ def draw_overlay(frame, tracked, tracks_ref, ego_kmh, gps_time_display, elapsed_
 				cv2.FONT_HERSHEY_SIMPLEX, 0.62, (220, 220, 220), 1, cv2.LINE_AA)
 
 	for x1, y1, x2, y2, cls_id, conf, tid in tracked:
-		clr = (0, 180, 255)
 		spd_txt = "---"
 		tr = tracks_ref.get(tid)
+		clr = (0, 180, 255)
 		if tr is not None and len(tr["history"]) >= 2:
 			spd_kmh = estimate_abs_speed_kmh(tr["history"], fw, ego_kmh)
 			if spd_kmh is not None:
 				spd_txt = f"{spd_kmh * KMH_TO_MPH:.0f}mph"
+			clr = vehicle_display_color(tr["history"], fw, ego_kmh)
 
 		cv2.rectangle(frame, (x1, y1), (x2, y2), clr, 2)
 		label = f"{class_name(cls_id)} {spd_txt}  {conf*100:.0f}%  ID{tid}"
@@ -284,7 +321,50 @@ def draw_overlay(frame, tracked, tracks_ref, ego_kmh, gps_time_display, elapsed_
 					0.55, (0, 0, 0), 2, cv2.LINE_AA)
 
 
-def play_video(video_path, total_files, idx, models, screen_w, screen_h):
+def draw_vehicle_summary(frame, tracked, tracks_ref, ego_kmh):
+	if not tracked:
+		return
+
+	fh, fw = frame.shape[:2]
+	panel_w = min(520, max(320, int(round((fw // 3) * 1.2))))
+	row_h = 34
+	max_rows = 8
+	panel_h = min(fh - 24, 56 + min(len(tracked), max_rows) * row_h)
+	x0 = max(12, fw - panel_w - 12)
+	y0 = 112
+	y1 = min(fh - 12, y0 + panel_h)
+	panel_h = y1 - y0
+
+	overlay = frame.copy()
+	cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y1), (0, 0, 0), -1)
+	cv2.addWeighted(overlay, 0.62, frame, 0.38, 0, frame)
+	cv2.rectangle(frame, (x0, y0), (x0 + panel_w, y1), (255, 220, 0), 2)
+	cv2.putText(frame, f"VEHICLES {len(tracked):02d}", (x0 + 12, y0 + 28),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 235, 120), 2, cv2.LINE_AA)
+	cv2.putText(frame, f"ego {ego_kmh * KMH_TO_MPH:4.1f} mph", (x0 + panel_w - 126, y0 + 28),
+				cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 220, 180), 1, cv2.LINE_AA)
+
+	rows = tracked[:max_rows]
+	for i, det in enumerate(rows):
+		x1, y1_box, x2, y2_box, cls_id, conf, tid = det
+		tr = tracks_ref.get(tid)
+		spd_txt = "---"
+		row_color = (0, 165, 255)
+		if tr is not None and len(tr["history"]) >= 2:
+			spd_kmh = estimate_abs_speed_kmh(tr["history"], fw, ego_kmh)
+			if spd_kmh is not None:
+				spd_txt = f"{spd_kmh * KMH_TO_MPH:.0f} mph"
+			row_color = vehicle_display_color(tr["history"], fw, ego_kmh)
+		label = f"ID{tid:02d} {class_name(cls_id)} {spd_txt}"
+		y = y0 + 54 + i * row_h
+		cv2.rectangle(frame, (x0 + 8, y - 20), (x0 + panel_w - 8, y + 8), row_color, -1)
+		cv2.putText(frame, label, (x0 + 14, y), cv2.FONT_HERSHEY_SIMPLEX,
+					0.60, (0, 0, 0), 2, cv2.LINE_AA)
+		cv2.putText(frame, f"{conf * 100:2.0f}%", (x0 + panel_w - 58, y), cv2.FONT_HERSHEY_SIMPLEX,
+					0.52, (0, 0, 0), 1, cv2.LINE_AA)
+
+
+def play_video(video_path, total_files, idx, models, screen_w, screen_h, writer=None):
 	print(f"[{idx}/{total_files}] Loading: {os.path.basename(video_path)}")
 
 	with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -305,6 +385,7 @@ def play_video(video_path, total_files, idx, models, screen_w, screen_h):
 	tracker = Tracker()
 	model_idx = 0
 	native_crop = False  # False = maximised crop+resize, True = native pixel crop
+	show_summary = False
 	crop_center = [None]  # [None] or [(fx, fy)] in frame coords
 	display_meta = [None]  # [(scale, x_off, y_off, fw, fh)] updated each frame
 
@@ -370,6 +451,10 @@ def play_video(video_path, total_files, idx, models, screen_w, screen_h):
 		tracked = tracker.update(dets, t_s)
 
 		draw_overlay(frame, tracked, tracker.tracks, ego_kmh, gps_time_display, elapsed)
+		if show_summary:
+			draw_vehicle_summary(frame, tracked, tracker.tracks, ego_kmh)
+		if writer is not None:
+			writer.write(frame)
 
 		# Update display transform metadata for mouse→frame mapping
 		scale = min(screen_w / fw, screen_h / fh)
@@ -394,6 +479,10 @@ def play_video(video_path, total_files, idx, models, screen_w, screen_h):
 			mode = "native pixel crop" if native_crop else "maximised crop + resize"
 			print(f"Crop mode: {mode}")
 			crop_center[0] = None  # reset to default position on mode change
+		if key == ord("s"):
+			show_summary = not show_summary
+			state = "on" if show_summary else "off"
+			print(f"Vehicle summary: {state}")
 
 	cap.release()
 	return True
@@ -415,6 +504,19 @@ def main():
 	print("Controls: [Q] Quit  [N] Next video  [M] Switch model")
 	print("Reference: https://github.com/autowarefoundation/auto_speed")
 
+	probe = cv2.VideoCapture(videos[0])
+	out_w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+	out_h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+	out_fps = probe.get(cv2.CAP_PROP_FPS) or 30.0
+	probe.release()
+	out_path = os.path.join(cwd, "autospeed.m4v")
+	fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+	writer = cv2.VideoWriter(out_path, fourcc, out_fps, (out_w, out_h))
+	if not writer.isOpened():
+		print(f"Failed to open output writer: {out_path}")
+		return
+	print(f"Writing processed video to: {out_path}")
+
 	models = []
 	for mp in MODEL_PATHS:
 		model_path = os.path.join(cwd, mp)
@@ -430,9 +532,13 @@ def main():
 	screen_w, screen_h = get_screen_resolution()
 	print(f"Screen resolution: {screen_w}x{screen_h}")
 
-	for i, vp in enumerate(videos, start=1):
-		if not play_video(vp, len(videos), i, models, screen_w, screen_h):
-			break
+	try:
+		for i, vp in enumerate(videos, start=1):
+			if not play_video(vp, len(videos), i, models, screen_w, screen_h, writer=writer):
+				break
+	finally:
+		writer.release()
+		print(f"Saved: {out_path}")
 
 	cv2.destroyAllWindows()
 

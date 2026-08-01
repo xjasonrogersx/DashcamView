@@ -1,5 +1,6 @@
-output.mp4
+*.mp4
+*.m4v
 models/
 camera/
-output2.m4v
 __pycache__/
+

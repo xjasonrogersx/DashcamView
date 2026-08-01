@@ -151,7 +151,7 @@ def draw_overlay(frame, steer_result, ego_kmh, gps_time_display, elapsed_display
 				0.8, (200, 200, 0), 2, cv2.LINE_AA)
 
 
-def play_video(video_path, total_files, idx, autosteer, screen_w, screen_h):
+def play_video(video_path, total_files, idx, autosteer, screen_w, screen_h, writer=None):
 	print(f"[{idx}/{total_files}] Loading: {os.path.basename(video_path)}")
 
 	with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
@@ -210,6 +210,8 @@ def play_video(video_path, total_files, idx, autosteer, screen_w, screen_h):
 
 		file_label = f"{idx}/{total_files}: {os.path.basename(video_path)}"
 		draw_overlay(frame, steer_result, ego_kmh, gps_time_display, elapsed, file_label)
+		if writer is not None:
+			writer.write(frame)
 
 		disp = fit_frame(frame, screen_w, screen_h)
 		cv2.imshow(win, disp)
@@ -241,13 +243,30 @@ def main():
 	print("Controls: [Q] Quit  [N] Next video")
 	print("Reference: https://github.com/autowarefoundation/auto_steer")
 
+	probe = cv2.VideoCapture(videos[0])
+	out_w = int(probe.get(cv2.CAP_PROP_FRAME_WIDTH))
+	out_h = int(probe.get(cv2.CAP_PROP_FRAME_HEIGHT))
+	out_fps = probe.get(cv2.CAP_PROP_FPS) or 30.0
+	probe.release()
+	out_path = os.path.join(cwd, "autosteer.m4v")
+	fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+	writer = cv2.VideoWriter(out_path, fourcc, out_fps, (out_w, out_h))
+	if not writer.isOpened():
+		print(f"Failed to open output writer: {out_path}")
+		return
+	print(f"Writing processed video to: {out_path}")
+
 	autosteer = AutoSteerONNX(model_path)
 	screen_w, screen_h = get_screen_resolution()
 	print(f"Screen resolution: {screen_w}x{screen_h}")
 
-	for i, vp in enumerate(videos, start=1):
-		if not play_video(vp, len(videos), i, autosteer, screen_w, screen_h):
-			break
+	try:
+		for i, vp in enumerate(videos, start=1):
+			if not play_video(vp, len(videos), i, autosteer, screen_w, screen_h, writer=writer):
+				break
+	finally:
+		writer.release()
+		print(f"Saved: {out_path}")
 
 	cv2.destroyAllWindows()
 
