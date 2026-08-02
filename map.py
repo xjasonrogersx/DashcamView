@@ -27,6 +27,8 @@ DEFAULT_ZOOM = 16
 OUTPUT_NAME = "map.m4v"
 ROAD_DATA_ZOOM = 15
 MIN_ROAD_FETCH_ZOOM = 9
+KMH_TO_MPH = 0.621371
+TYPICAL_LANE_WIDTH_M = 3.65
 
 
 def discover_pbf_files(base_dir, pbf_arg=None):
@@ -448,11 +450,11 @@ def nearest_road_info(lat, lon, roads):
 
 def format_road_info(road_info):
     if road_info is None:
-        return "ROAD: unknown", "LIMIT: unknown"
+        return "ROAD: unknown", "LANES: unknown"
 
     dist = road_info["distance_m"]
     if dist > 80.0:
-        return "ROAD: unknown", "LIMIT: unknown"
+        return "ROAD: unknown", "LANES: unknown"
 
     name = road_info.get("name")
     ref = road_info.get("ref")
@@ -468,9 +470,8 @@ def format_road_info(road_info):
     if ref and name:
         road_label = f"{name} ({ref})"
 
-    speed_label = str(speed).strip() if speed else "unknown"
     lanes_label = lanes_text if lanes_total is not None else "unknown"
-    return f"ROAD: {road_label}", f"LIMIT: {speed_label}  LANES: {lanes_label}"
+    return f"ROAD: {road_label}", f"LANES: {lanes_label}"
 
 
 def lane_info_for_display(lanes_value, lanes_forward, lanes_backward):
@@ -511,7 +512,7 @@ def parse_lane_count(lanes_value):
         return None
 
 
-def road_line_thickness(road):
+def road_line_thickness(road, px_per_meter, use_typical_lane_width=False):
     base_by_highway = {
         "motorway": 10,
         "trunk": 9,
@@ -532,10 +533,67 @@ def road_line_thickness(road):
         road.get("lanes_backward"),
     )
     if lanes is not None:
-        # Use 4 pixels per lane when lane count is known.
-        lane_based = int(lanes) * 4
+        if use_typical_lane_width:
+            # Width from typical lane width projected into pixels.
+            lane_based = int(round(lanes * TYPICAL_LANE_WIDTH_M * px_per_meter))
+        else:
+            # Use 4 pixels per lane when lane count is known.
+            lane_based = int(lanes) * 4
         base = max(base, lane_based)
     return max(3, min(20, base))
+
+
+def parse_speed_limit_mph(maxspeed_value):
+    if maxspeed_value is None:
+        return None
+
+    s = str(maxspeed_value).strip().lower()
+    if not s:
+        return None
+
+    first = s.split(";")[0].strip()
+    m = re.search(r"\d+(?:\.\d+)?", first)
+    if m is None:
+        return None
+
+    val = float(m.group(0))
+    if "km" in first or "kph" in first:
+        return val * KMH_TO_MPH
+    if "mph" in first:
+        return val
+    # In UK OSM data, plain numeric maxspeed is typically mph.
+    return val
+
+
+def draw_speedlimit_widget(frame, speed_limit_mph, current_mph, visible):
+    if not visible:
+        return
+
+    h, w = frame.shape[:2]
+    center = (w - 95, h - 120)
+    radius = 58
+
+    cv2.circle(frame, center, radius, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(frame, center, radius, (30, 30, 220), 9, cv2.LINE_AA)
+
+    limit_text = "--" if speed_limit_mph is None else str(int(round(speed_limit_mph)))
+    (tw, th), _ = cv2.getTextSize(limit_text, cv2.FONT_HERSHEY_DUPLEX, 1.25, 3)
+    cv2.putText(
+        frame,
+        limit_text,
+        (center[0] - tw // 2, center[1] + th // 3),
+        cv2.FONT_HERSHEY_DUPLEX,
+        1.25,
+        (30, 30, 30),
+        3,
+        cv2.LINE_AA,
+    )
+
+    current_txt = f"{current_mph:4.1f} mph"
+    (sw, _), _ = cv2.getTextSize(current_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)
+    y = center[1] + radius + 30
+    cv2.rectangle(frame, (center[0] - sw // 2 - 8, y - 24), (center[0] + sw // 2 + 8, y + 8), (0, 0, 0), -1)
+    cv2.putText(frame, current_txt, (center[0] - sw // 2, y), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (235, 235, 235), 2, cv2.LINE_AA)
 
 
 def road_line_color(road):
@@ -674,7 +732,7 @@ def gps_state_at_time(df, t_s, last_heading_deg):
     }
 
 
-def render_heading_up_map(state, zoom, out_w, out_h, trail_latlon, road_cache):
+def render_heading_up_map(state, zoom, out_w, out_h, trail_latlon, road_cache, use_typical_lane_width=False):
     lat = state["lat"]
     lon = state["lon"]
     heading = state["heading_deg"]
@@ -721,7 +779,7 @@ def render_heading_up_map(state, zoom, out_w, out_h, trail_latlon, road_cache):
             pts.append(project_point_to_screen(wlat, wlon, lat, lon, heading, px_per_meter, car_px))
         if len(pts) >= 2:
             poly = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
-            thickness = road_line_thickness(way)
+            thickness = road_line_thickness(way, px_per_meter, use_typical_lane_width=use_typical_lane_width)
             center_color = road_line_color(way)
             # Two-pass stroke makes width differences easier to see.
             cv2.polylines(frame, [poly], False, (45, 45, 45), thickness + 2, cv2.LINE_AA)
@@ -756,15 +814,17 @@ def draw_vehicle_icon(frame, center):
     cv2.circle(frame, (cx, cy + 16), 6, (220, 220, 220), -1, cv2.LINE_AA)
 
 
-def draw_hud(frame, video_label, gps_time_text, elapsed_text, speed_kmh, zoom, road_text, limit_text, road_count):
+def draw_hud(frame, video_label, gps_time_text, elapsed_text, speed_kmh, zoom, road_text, lane_text, road_count, use_typical_lane_width, show_speed_sign):
     h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0, 0), (w, 160), (0, 0, 0), -1)
+    cv2.rectangle(frame, (0, 0), (w, 190), (0, 0, 0), -1)
     cv2.putText(frame, f"{video_label}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (220, 220, 220), 2, cv2.LINE_AA)
     cv2.putText(frame, f"GPS: {gps_time_text}  ELAPSED: {elapsed_text}", (16, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (190, 190, 190), 2, cv2.LINE_AA)
     cv2.putText(frame, f"SPEED: {speed_kmh:5.1f} km/h  ZOOM: {zoom}  ROADS: {road_count}", (16, 104), cv2.FONT_HERSHEY_DUPLEX, 0.9, (100, 255, 100), 2, cv2.LINE_AA)
     cv2.putText(frame, road_text, (16, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (220, 220, 130), 2, cv2.LINE_AA)
-    cv2.putText(frame, limit_text, (w - 420, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (220, 220, 130), 2, cv2.LINE_AA)
-    cv2.putText(frame, "OSM raw highways", (w - 300, h - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (220, 220, 220), 2, cv2.LINE_AA)
+    cv2.putText(frame, lane_text, (w - 420, 138), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (220, 220, 130), 2, cv2.LINE_AA)
+    mode_txt = f"T lane-width: {'3.65m' if use_typical_lane_width else '4px/lane'}   O speed-sign: {'ON' if show_speed_sign else 'OFF'}"
+    cv2.putText(frame, mode_txt, (16, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (200, 200, 200), 2, cv2.LINE_AA)
+    # cv2.putText(frame, "OSM raw highways", (w - 300, h - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (220, 220, 220), 2, cv2.LINE_AA)
 
 
 def play_video_map(video_path, total_files, idx, writer, out_w, out_h, screen_w, screen_h, road_cache, zoom_start):
@@ -802,6 +862,8 @@ def play_video_map(video_path, total_files, idx, writer, out_w, out_h, screen_w,
     trail = []
     last_heading = 0.0
     warned_no_roads = False
+    use_typical_lane_width = False
+    show_speed_sign = True
 
     while cap.isOpened():
         ret, _ = cap.read()
@@ -820,8 +882,18 @@ def play_video_map(video_path, total_files, idx, writer, out_w, out_h, screen_w,
         if len(trail) > 600:
             trail = trail[-600:]
 
-        frame, road_info, road_count = render_heading_up_map(gps_state, zoom, out_w, out_h, trail, road_cache)
-        road_text, limit_text = format_road_info(road_info)
+        frame, road_info, road_count = render_heading_up_map(
+            gps_state,
+            zoom,
+            out_w,
+            out_h,
+            trail,
+            road_cache,
+            use_typical_lane_width=use_typical_lane_width,
+        )
+        road_text, lane_text = format_road_info(road_info)
+        speed_limit_mph = parse_speed_limit_mph(road_info.get("maxspeed") if road_info is not None else None)
+        current_mph = gps_state["speed_kmh"] * KMH_TO_MPH
 
         if road_count == 0 and not warned_no_roads:
             print(
@@ -852,9 +924,12 @@ def play_video_map(video_path, total_files, idx, writer, out_w, out_h, screen_w,
             gps_state["speed_kmh"],
             zoom,
             road_text,
-            limit_text,
+            lane_text,
             road_count,
+            use_typical_lane_width,
+            show_speed_sign,
         )
+        draw_speedlimit_widget(frame, speed_limit_mph, current_mph, show_speed_sign)
 
         writer.write(frame)
 
@@ -871,6 +946,12 @@ def play_video_map(video_path, total_files, idx, writer, out_w, out_h, screen_w,
             zoom = min(MAX_ZOOM, zoom + 1)
         if key in (ord("-"), ord("_")):
             zoom = max(MIN_ZOOM, zoom - 1)
+        if key == ord("t"):
+            use_typical_lane_width = not use_typical_lane_width
+            print(f"Lane width mode: {'3.65m per lane' if use_typical_lane_width else '4px per lane'}")
+        if key == ord("o"):
+            show_speed_sign = not show_speed_sign
+            print(f"Speed-limit sign: {'ON' if show_speed_sign else 'OFF'}")
 
     cap.release()
     return True, zoom
@@ -928,7 +1009,7 @@ def main():
 
     print(f"Found {len(videos)} MP4 file(s).")
     print(f"Road data source: {data_source}")
-    print("Controls: [Q] Quit  [N] Next video  [+] Zoom In  [-] Zoom Out")
+    print("Controls: [Q] Quit  [N] Next video  [+] Zoom In  [-] Zoom Out  [T] Lane Width Mode  [O] Speed Sign")
     print("Rendering heading-up OpenStreetMap roads from raw OSM data...")
 
     zoom = DEFAULT_ZOOM
