@@ -4,3 +4,5 @@ models/
 camera/
 __pycache__/
 
+.tile_cache/
+pbf/*.pbf
